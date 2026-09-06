@@ -59,12 +59,10 @@ daemon_json=$(jq -n --arg dns "$resolver" '{
   "log-driver": "json-file",
   "log-opts": {"max-size": "10m", "max-file": "3"}
 }')
-install -d -m 755 /etc/docker
 if [ "$(cat /etc/docker/daemon.json 2>/dev/null)" != "$daemon_json" ]; then
   printf '%s\n' "$daemon_json" > /etc/docker/daemon.json
   systemctl restart docker
 fi
-systemctl enable --now docker
 
 # The agent itself never reaches this group: its shell is inside the container and
 # no docker socket is mounted there. It is the backend, running as hermes on the
@@ -144,22 +142,28 @@ echo "==> rendering .env from Secrets Manager"
 as_hermes /usr/local/bin/hermes-render-env
 
 # --- 5. config ---------------------------------------------------------------
-# The shipped default is anthropic/claude-opus-4.6, which has no key.
+# model.default: the shipped default is anthropic/claude-opus-4.6, which has no key.
+#
+# The rest is Phase 3 hardening. Under the docker backend the container *is* the
+# security boundary, so Hermes skips the dangerous-command approval stack entirely —
+# which is the point: no prompt to answer, and nothing it runs touches the host.
+# container_memory: the shipped 5120MB is more memory than this box has, so a runaway
+# container would take the gateway down with it rather than hit its own cap first.
+# The two approvals keys are already the shipped defaults, pinned so an upstream
+# change to either is a diff here rather than a silent policy change on a headless
+# box. They decide what a cron job does when it hits a dangerous command with nobody
+# around to approve it.
 echo "==> config"
-as_hermes bash -lc "hermes config set model.default '$MODEL_DEFAULT'"
-
-# Phase 3 hardening. Under the docker backend the container *is* the security
-# boundary, so Hermes skips the dangerous-command approval stack entirely — which
-# is the point: no prompt to answer, and nothing it runs touches the host.
-as_hermes bash -lc "hermes config set terminal.backend docker"
-# The shipped 5120MB is more memory than this box has, so a runaway container would
-# take the gateway down with it rather than hit its own cap first.
-as_hermes bash -lc "hermes config set terminal.container_memory 2048"
-# Both already the shipped defaults; pinned so an upstream default change is a diff
-# here rather than a silent policy change on a headless box. They decide what a cron
-# job does when it hits a dangerous command with nobody around to approve it.
-as_hermes bash -lc "hermes config set approvals.mode smart"
-as_hermes bash -lc "hermes config set approvals.cron_mode deny"
+# set -e inside the shell too: without it only the last command's status escapes, and
+# a failed set in the middle of the list would pass silently.
+as_hermes bash -lc "
+  set -e
+  hermes config set model.default '$MODEL_DEFAULT'
+  hermes config set terminal.backend docker
+  hermes config set terminal.container_memory 2048
+  hermes config set approvals.mode smart
+  hermes config set approvals.cron_mode deny
+"
 
 # --- 6. verify ---------------------------------------------------------------
 # A real completion through the configured provider — the only check proving the
@@ -167,12 +171,13 @@ as_hermes bash -lc "hermes config set approvals.cron_mode deny"
 echo "==> verifying"
 as_hermes bash -lc "hermes -z 'Reply with exactly: hermes online. Do not use any tools.'"
 
-# Pulling the sandbox image here rather than letting the first agent command block
-# on ~1GB of registry traffic. Doubles as the check on the daemon-DNS fix above:
+# Pull the sandbox image here rather than let the first agent command block on ~1GB
+# of registry traffic; skipped once it is local, so a re-run costs no registry round
+# trip. The throwaway container after it is the check on the daemon-DNS fix above —
 # name resolution inside a container is the part that fails silently.
 image=$(as_hermes bash -lc "hermes config get terminal.docker_image")
 echo "==> sandbox image: $image"
-as_hermes docker pull -q "$image"
+as_hermes docker image inspect "$image" >/dev/null 2>&1 || as_hermes docker pull -q "$image"
 as_hermes docker run --rm "$image" \
   sh -c 'getent hosts api.moonshot.ai >/dev/null && echo container-dns-ok' \
   | grep -qx container-dns-ok
