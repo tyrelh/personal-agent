@@ -40,3 +40,20 @@ loginctl enable-linger hermes
 # Masked, not just disabled: socket activation would otherwise revive sshd.
 systemctl disable --now ssh.socket ssh.service || true
 systemctl mask ssh.socket ssh.service
+
+# --- Phase 2 ----------------------------------------------------------------
+# install_hermes.sh, injected verbatim by terraform's templatefile(). It lands on
+# disk as well as running, so it stays re-runnable by hand later (FORCE=1 to
+# reinstall) without going near cloud-init.
+#
+# Deliberately the LAST thing in this file. It is the slow, network-dependent,
+# most-likely-to-fail step — roughly ten minutes, most of it a `curl | bash` of an
+# upstream installer. Everything that makes the box reachable and locked down has
+# already happened above, so if this fails the box still comes up on the tailnet
+# with sshd masked and you can debug it over SSH. Pin the upstream with
+# HERMES_COMMIT=<sha> below if a rebuild ever needs to match this one exactly.
+cat > /usr/local/sbin/hermes-install <<'HERMES_INSTALL_EOF'
+${install_hermes}
+HERMES_INSTALL_EOF
+chmod 755 /usr/local/sbin/hermes-install
+SECRET_ID='${secret_id}' REGION='${region}' /usr/local/sbin/hermes-install

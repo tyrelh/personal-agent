@@ -116,9 +116,11 @@ resource "aws_instance" "hermes" {
 
   # Changing this does NOT replace the instance (user_data_replace_on_change
   # defaults false) — cloud-init only runs it on first boot. Rebuild deliberately.
+  # install_hermes.sh goes through file(), not templatefile() — README Phase 2 says why.
   user_data = templatefile("${path.module}/user_data.sh", {
-    secret_id = data.aws_secretsmanager_secret.hermes.name
-    region    = data.aws_region.current.region
+    secret_id      = data.aws_secretsmanager_secret.hermes.name
+    region         = data.aws_region.current.region
+    install_hermes = file("${path.module}/install_hermes.sh")
   })
 
   credit_specification {
