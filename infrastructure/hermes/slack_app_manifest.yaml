@@ -17,6 +17,12 @@ features:
   bot_user:
     display_name: Hermes
     always_online: true
+  # Without these two the DM tab renders "Sending messages to this app has been
+  # turned off" and no message ever reaches the gateway — the scopes are irrelevant
+  # until the tab itself is on.
+  app_home:
+    messages_tab_enabled: true
+    messages_tab_read_only_enabled: false
 
 oauth_config:
   scopes:
