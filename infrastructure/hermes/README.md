@@ -1,8 +1,11 @@
 # hermes infrastructure
 
-Phase 0 of the Hermes agent plan: state backend, EC2 host, secret container, IAM.
+Phase 0 of the Hermes agent plan: state backend, EC2 host, IAM.
 
 ## Apply
+
+The `hermes` secret must already exist (see below) — terraform reads it as a data
+source and fails the plan if it is missing.
 
 ```sh
 terraform init
@@ -10,21 +13,24 @@ terraform plan
 terraform apply
 ```
 
-State lives in `s3://superflux-terraform-state/hermes/terraform.tfstate` (`ca-west-1`),
+State lives in `s3://superflux-terraform-state/hermes.tfstate` (`ca-west-1`),
 locked with S3 native locking. The bucket is bootstrapped by hand and is not managed here.
 
-## Load the secret (once, by hand)
+## Create the secret (once, by hand — before the first apply)
 
-Terraform manages the secret *container* only. The value is loaded by CLI so no key
+Terraform does not manage the secret at all: it looks it up by name so no key
 material ever reaches state.
 
 ```sh
-aws secretsmanager put-secret-value \
+aws secretsmanager create-secret \
   --region ca-west-1 \
-  --secret-id hermes \
+  --name hermes \
+  --description "Hermes agent env blob: LLM keys, Slack tokens, Tailscale auth key" \
   --secret-string file://hermes.json
 rm hermes.json
 ```
+
+To rotate later, same thing with `put-secret-value --secret-id hermes`.
 
 `hermes.json` (never commit it):
 
@@ -36,7 +42,7 @@ rm hermes.json
   "SLACK_APP_TOKEN": "",
   "SLACK_ALLOWED_USERS": "",
   "FIRECRAWL_API_KEY": "",
-  "TS_AUTHKEY": ""
+  "TAILSCALE_AUTH_KEY": ""
 }
 ```
 
