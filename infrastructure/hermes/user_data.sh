@@ -30,3 +30,13 @@ TS_AUTHKEY=$(aws secretsmanager get-secret-value \
 
 tailscale up --authkey "$TS_AUTHKEY" --ssh --advertise-tags=tag:hermes --hostname hermes
 unset TS_AUTHKEY
+
+# Non-root service user. Linger so its systemd units (the gateway, later) start at
+# boot without a login session.
+id hermes >/dev/null 2>&1 || useradd -m -s /bin/bash hermes
+loginctl enable-linger hermes
+
+# Tailscale SSH is up and is now the only interactive path; SSM stays as break-glass.
+# Masked, not just disabled: socket activation would otherwise revive sshd.
+systemctl disable --now ssh.socket ssh.service || true
+systemctl mask ssh.socket ssh.service
