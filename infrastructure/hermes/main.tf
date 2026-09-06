@@ -46,3 +46,5 @@ data "aws_subnets" "default" {
 data "aws_ssm_parameter" "ubuntu_2404_arm64" {
   name = "/aws/service/canonical/ubuntu/server/24.04/stable/current/arm64/hvm/ebs-gp3/ami-id"
 }
+
+data "aws_region" "current" {}

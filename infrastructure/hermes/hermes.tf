@@ -71,6 +71,17 @@ resource "aws_vpc_security_group_egress_rule" "tailscale" {
   to_port           = 41641
 }
 
+# Without STUN, Tailscale never gets a direct path and falls back to relaying
+# every packet over DERP on 443. It works, it's just slow.
+resource "aws_vpc_security_group_egress_rule" "stun" {
+  security_group_id = aws_security_group.hermes.id
+  description       = "Tailscale NAT traversal (STUN)"
+  cidr_ipv4         = "0.0.0.0/0"
+  ip_protocol       = "udp"
+  from_port         = 3478
+  to_port           = 3478
+}
+
 # Not in the plan's "443 + 41641" list, but the box does not boot usefully without
 # them: Ubuntu's arm64 apt mirrors are plain HTTP, and DNS goes to the VPC resolver.
 resource "aws_vpc_security_group_egress_rule" "http" {
@@ -103,6 +114,13 @@ resource "aws_instance" "hermes" {
 
   # Ephemeral public IP, no EIP. Nothing should ever point at this box.
   associate_public_ip_address = true
+
+  # Changing this does NOT replace the instance (user_data_replace_on_change
+  # defaults false) — cloud-init only runs it on first boot. Rebuild deliberately.
+  user_data = templatefile("${path.module}/user_data.sh", {
+    secret_id = aws_secretsmanager_secret.hermes.name
+    region    = data.aws_region.current.region
+  })
 
   credit_specification {
     cpu_credits = "unlimited"
