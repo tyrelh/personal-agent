@@ -1,10 +1,10 @@
 terraform {
   # 1.11+ for native S3 state locking (use_lockfile); DynamoDB args are deprecated.
-  required_version = ">= 1.11"
+  required_version = ">= 1.16"
 
   backend "s3" {
     bucket       = "superflux-terraform-state"
-    key          = "hermes/terraform.tfstate"
+    key          = "hermes.tfstate"
     region       = "ca-west-1"
     encrypt      = true
     use_lockfile = true
@@ -13,7 +13,7 @@ terraform {
   required_providers {
     aws = {
       source  = "hashicorp/aws"
-      version = "~> 6.0"
+      version = "~> 6.63"
     }
   }
 }
