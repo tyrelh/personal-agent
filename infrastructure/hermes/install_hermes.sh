@@ -223,7 +223,12 @@ else
 ExecStartPre=/usr/local/bin/hermes-render-env
 DROPIN_EOF
   systemctl daemon-reload
-  systemctl restart hermes-gateway
+  # The CLI's own restart, not systemctl: it first rewrites the unit to match what
+  # this install would generate. `install --force` alone leaves a unit that `hermes
+  # gateway status` then reports as outdated — the generated PATH order depends on
+  # the invoking environment. It also drains in-flight turns before stopping, so a
+  # re-run mid-conversation waits rather than cutting the agent off.
+  "$HERMES_HOME/.local/bin/hermes" gateway restart --system
   systemctl is-active --quiet hermes-gateway || { systemctl status --no-pager -l hermes-gateway; exit 1; }
   echo "==> gateway running"
 fi
