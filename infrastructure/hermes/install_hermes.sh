@@ -183,3 +183,47 @@ as_hermes docker run --rm "$image" \
   | grep -qx container-dns-ok
 
 as_hermes bash -lc 'hermes --version' | head -1
+
+# --- 7. gateway (Phase 4) ----------------------------------------------------
+# Only once the Slack tokens are actually in the secret; until then this is a no-op,
+# so the script stays runnable on a box that has no chat platform yet.
+#
+# System unit rather than a --user one: root can restart it over Tailscale SSH, and
+# it starts at boot without depending on the hermes user's linger. It still runs as
+# hermes — never root.
+env_file="$HERMES_HOME/.hermes/.env"
+if ! grep -q '^SLACK_BOT_TOKEN=' "$env_file"; then
+  echo "==> no SLACK_BOT_TOKEN in the secret — skipping the gateway (Phase 4)"
+else
+  # Fail closed. An unset allowlist means deny-all, so the bot would install, start,
+  # connect, and then ignore every message — a failure that looks like a Slack
+  # problem. GATEWAY_ALLOW_ALL_USERS is never the fix.
+  grep -q '^SLACK_ALLOWED_USERS=.' "$env_file" || {
+    echo "SLACK_BOT_TOKEN is set but SLACK_ALLOWED_USERS is empty — refusing to install a deny-all gateway" >&2
+    exit 1
+  }
+
+  echo "==> installing the gateway service"
+  # Run as root, not as hermes: a --system install writes to /etc/systemd/system and
+  # the CLI refuses it from a non-root uid. --run-as-user is what keeps the unit's
+  # User= (and its remapped HERMES_HOME) pointed at hermes rather than root.
+  # --force so a re-run converges the unit rather than leaving a stale one; the start
+  # is deferred until the drop-in below exists.
+  "$HERMES_HOME/.local/bin/hermes" gateway install --system \
+    --run-as-user "$HERMES_USER" --force --no-start-now --start-on-login
+
+  # The unit hermes generates has no ExecStartPre, so rotation is a drop-in: re-render
+  # .env from Secrets Manager on every start. Rotating a key is then "update the
+  # secret, restart the unit". A drop-in rather than an edit — hermes compares the
+  # installed unit against what it would generate and reports an edited one as drift.
+  mkdir -p /etc/systemd/system/hermes-gateway.service.d
+  cat > /etc/systemd/system/hermes-gateway.service.d/10-render-env.conf <<'DROPIN_EOF'
+[Service]
+# Runs as the unit's User= (hermes) with its HOME, which is what render-env needs.
+ExecStartPre=/usr/local/bin/hermes-render-env
+DROPIN_EOF
+  systemctl daemon-reload
+  systemctl restart hermes-gateway
+  systemctl is-active --quiet hermes-gateway || { systemctl status --no-pager -l hermes-gateway; exit 1; }
+  echo "==> gateway running"
+fi

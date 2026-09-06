@@ -1,0 +1,50 @@
+# Slack app manifest for the Hermes gateway — Phase 4.
+#
+# Create the app from this file at https://api.slack.com/apps → Create New App →
+# From an app manifest, in a *personal* workspace (never the Giftbit one: this bot
+# has shell access). Everything below is what the plan's Phase 4 asks for; the two
+# tokens it produces go in the `hermes` secret, not here.
+#
+# socket_mode_enabled is the whole reason there is no request_url anywhere in this
+# file: the app dials out to Slack over a WebSocket, so the security group keeps its
+# zero ingress rules.
+display_information:
+  name: Hermes
+  description: Personal agent
+  background_color: "#1a1a1a"
+
+features:
+  bot_user:
+    display_name: Hermes
+    always_online: true
+
+oauth_config:
+  scopes:
+    bot:
+      - app_mentions:read
+      - channels:history   # without this the bot silently receives nothing in public channels
+      - channels:read
+      - chat:write
+      - files:read
+      - files:write
+      - groups:history     # same, for private channels
+      - im:history
+      - im:read
+      - im:write
+      - mpim:history
+      - mpim:read
+      - users:read
+
+settings:
+  event_subscriptions:
+    bot_events:
+      - app_mention
+      - message.channels
+      - message.groups
+      - message.im
+      - message.mpim
+  interactivity:
+    is_enabled: false
+  org_deploy_enabled: false
+  socket_mode_enabled: true
+  token_rotation_enabled: false
