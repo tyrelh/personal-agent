@@ -47,6 +47,7 @@ To rotate later, same thing with `put-secret-value --secret-id hermes`.
   "SLACK_BOT_TOKEN": "",
   "SLACK_APP_TOKEN": "",
   "SLACK_ALLOWED_USERS": "",
+  "SLACK_HOME_CHANNEL": "",
   "FIRECRAWL_API_KEY": "",
   "TAILSCALE_AUTH_KEY": ""
 }
@@ -58,7 +59,7 @@ Keys are copied into `~/.hermes/.env` verbatim by `hermes-render-env`, so their 
 are the names Hermes reads — with two deliberate exceptions it handles for you,
 `MOONSHOT_API_KEY` and `TAILSCALE_AUTH_KEY`. See Phase 2 below. Empty values are
 skipped rather than rendered as blanks, so the placeholders above are harmless until
-filled; only `MOONSHOT_API_KEY` and `TAILSCALE_AUTH_KEY` are set today.
+filled; `ANTHROPIC_API_KEY` and `FIRECRAWL_API_KEY` are the ones still empty today.
 
 ## Access
 
@@ -326,6 +327,15 @@ linger. It still runs as `hermes` — the plan's "never run the gateway as root"
 `User=hermes` in the unit, not the uid that installed it. `--system` *does* have to
 be installed by root; the CLI refuses it otherwise and remaps `HERMES_HOME` to the
 target user itself.
+
+**4. Home channel.** Where cron results and cross-platform messages land. Hermes
+prompts for `/hermes sethome` in chat, which needs a `/hermes` slash command
+registered on the app — this manifest deliberately has none. Use `SLACK_HOME_CHANNEL`
+in the secret instead: it is read at every start and overrides the stored value, so a
+rebuilt box keeps its home channel instead of waiting for someone to remember the
+click. Create the channel, invite the bot (`/invite @Hermes`), take its ID from
+*View channel details* → bottom (`C…`), add it to the secret, then
+`ssh root@hermes systemctl restart hermes-gateway`.
 
 **The allowlist is a hard gate.** `SLACK_ALLOWED_USERS` unset means deny-all, so the
 bot would install, connect, and then ignore every message — a failure that looks like
