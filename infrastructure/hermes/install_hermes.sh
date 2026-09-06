@@ -38,7 +38,42 @@ export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 apt-get update -qq
 apt-get install -y -qq build-essential ripgrep ffmpeg libatomic1
 
-# --- 2. hermes itself --------------------------------------------------------
+# --- 2. docker ---------------------------------------------------------------
+# Phase 3: agent shell commands run in a container instead of on the host. Ubuntu's
+# docker.io rather than docker-ce — one apt line, no third-party apt repo, and
+# nothing here wants a newer engine.
+echo "==> docker"
+apt-get install -y -qq docker.io
+
+# Containers inherit the host's resolv.conf *except* when it points at a loopback
+# resolver, which noble's systemd-resolved does (127.0.0.53). Docker then silently
+# substitutes its own public defaults (8.8.8.8), which the security group has no
+# egress rule for — so every lookup inside every container hangs until it times out.
+# Point the daemon at the VPC resolver the host is actually using.
+# Log rotation is here for the same reason everything else on a 30GB root volume is:
+# the default json-file driver never rotates.
+resolver=$(awk '/^nameserver/ {print $2; exit}' /run/systemd/resolve/resolv.conf)
+[ -n "$resolver" ] || { echo "no upstream resolver in /run/systemd/resolve/resolv.conf" >&2; exit 1; }
+daemon_json=$(jq -n --arg dns "$resolver" '{
+  dns: [$dns],
+  "log-driver": "json-file",
+  "log-opts": {"max-size": "10m", "max-file": "3"}
+}')
+if [ "$(cat /etc/docker/daemon.json 2>/dev/null)" != "$daemon_json" ]; then
+  printf '%s\n' "$daemon_json" > /etc/docker/daemon.json
+  systemctl restart docker
+fi
+
+# The agent itself never reaches this group: its shell is inside the container and
+# no docker socket is mounted there. It is the backend, running as hermes on the
+# host, that has to talk to the daemon.
+# ponytail: docker group is root-equivalent on the host for anything that does
+# escape the container. Rootless docker closes that; it costs a userns AppArmor
+# profile on noble. Worth doing if this ever has to hold against a hostile agent
+# rather than a wrong one.
+usermod -aG docker "$HERMES_USER"
+
+# --- 3. hermes itself --------------------------------------------------------
 # Browser and computer-use are skipped: they pull Playwright's Chromium, the largest
 # and least reliable part of the install, and nothing before Phase 4 needs them.
 if [ "$FORCE" != "1" ] && ver=$(as_hermes bash -lc 'hermes --version' 2>/dev/null | head -1) && [ -n "$ver" ]; then
@@ -52,7 +87,7 @@ else
     ${HERMES_COMMIT:+--commit "$HERMES_COMMIT"}
 fi
 
-# --- 3. secrets --------------------------------------------------------------
+# --- 4. secrets --------------------------------------------------------------
 # Lives at /usr/local/bin so the Phase 4 gateway unit can call it from ExecStartPre;
 # rotation is then "update the secret, restart the unit". Written here rather than
 # shipped as a second file so this script stays pipeable at a bare box.
@@ -106,15 +141,45 @@ chmod 755 /usr/local/bin/hermes-render-env
 echo "==> rendering .env from Secrets Manager"
 as_hermes /usr/local/bin/hermes-render-env
 
-# --- 4. config ---------------------------------------------------------------
-# The shipped default is anthropic/claude-opus-4.6, which has no key. Phase 3's
-# hardening settings belong here too once they land.
+# --- 5. config ---------------------------------------------------------------
+# model.default: the shipped default is anthropic/claude-opus-4.6, which has no key.
+#
+# The rest is Phase 3 hardening. Under the docker backend the container *is* the
+# security boundary, so Hermes skips the dangerous-command approval stack entirely —
+# which is the point: no prompt to answer, and nothing it runs touches the host.
+# container_memory: the shipped 5120MB is more memory than this box has, so a runaway
+# container would take the gateway down with it rather than hit its own cap first.
+# The two approvals keys are already the shipped defaults, pinned so an upstream
+# change to either is a diff here rather than a silent policy change on a headless
+# box. They decide what a cron job does when it hits a dangerous command with nobody
+# around to approve it.
 echo "==> config"
-as_hermes bash -lc "hermes config set model.default '$MODEL_DEFAULT'"
+# set -e inside the shell too: without it only the last command's status escapes, and
+# a failed set in the middle of the list would pass silently.
+as_hermes bash -lc "
+  set -e
+  hermes config set model.default '$MODEL_DEFAULT'
+  hermes config set terminal.backend docker
+  hermes config set terminal.container_memory 2048
+  hermes config set approvals.mode smart
+  hermes config set approvals.cron_mode deny
+"
 
-# --- 5. verify ---------------------------------------------------------------
+# --- 6. verify ---------------------------------------------------------------
 # A real completion through the configured provider — the only check proving the
 # key, the base URL and the model slug all line up.
 echo "==> verifying"
 as_hermes bash -lc "hermes -z 'Reply with exactly: hermes online. Do not use any tools.'"
+
+# Pull the sandbox image here rather than let the first agent command block on ~1GB
+# of registry traffic; skipped once it is local, so a re-run costs no registry round
+# trip. The throwaway container after it is the check on the daemon-DNS fix above —
+# name resolution inside a container is the part that fails silently.
+image=$(as_hermes bash -lc "hermes config get terminal.docker_image")
+echo "==> sandbox image: $image"
+as_hermes docker image inspect "$image" >/dev/null 2>&1 || as_hermes docker pull -q "$image"
+as_hermes docker run --rm "$image" \
+  sh -c 'getent hosts api.moonshot.ai >/dev/null && echo container-dns-ok' \
+  | grep -qx container-dns-ok
+
 as_hermes bash -lc 'hermes --version' | head -1

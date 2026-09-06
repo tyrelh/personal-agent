@@ -1,10 +1,10 @@
 # hermes infrastructure
 
-Phase 0 of the Hermes agent plan: state backend, EC2 host, IAM. Phases 1 and 2 —
-base OS, Tailscale, and the Hermes install itself — run unattended at first boot:
-`user_data.sh` does the base OS and ends by running `install_hermes.sh`, which
-terraform injects into it. A fresh `terraform apply` reaches a verified agent with
-no manual steps.
+Phase 0 of the Hermes agent plan: state backend, EC2 host, IAM. Phases 1 to 3 —
+base OS, Tailscale, the Hermes install and the sandbox hardening — run unattended at
+first boot: `user_data.sh` does the base OS and ends by running `install_hermes.sh`,
+which terraform injects into it. A fresh `terraform apply` reaches a verified,
+container-sandboxed agent with no manual steps.
 
 ## Apply
 
@@ -206,6 +206,72 @@ unconfigured chat platforms, and two npm advisories in build-time tooling. `herm
 check` listing hundreds of `○` variables is not an error either — those are the optional
 integrations we do not use.
 
+## Phase 3 — sandbox the agent's shell
+
+Section 2 of `install_hermes.sh` installs Docker; section 5 points Hermes at it. It is
+the same file as Phase 2, so it deploys the same way — re-run
+`/usr/local/sbin/hermes-install` on a running box, or get it for free on a rebuild.
+
+Five settings, and one of them is the whole phase:
+
+| Key | Value | Why |
+|---|---|---|
+| `terminal.backend` | `docker` | The agent's shell runs in a container, not on the host. |
+| `terminal.container_memory` | `2048` | Shipped default is 5120MB — more than this 4GB box has. |
+| `approvals.mode` | `smart` | Already the default; pinned so an upstream change shows as a diff. |
+| `approvals.cron_mode` | `deny` | Ditto. Decides what a headless cron job does with a dangerous command. |
+| `model.default` | `kimi/kimi-k3` | Phase 2. |
+
+The rest of the plan's Phase 3 list needs no code: `.env` is already `chmod 600`
+(`hermes-render-env` writes it under `umask 077`), the dashboard's default bind is
+`127.0.0.1` and nothing has been told otherwise, `GATEWAY_ALLOW_ALL_USERS` is simply
+not in the secret, and the gateway does not exist until Phase 4 — when it must be
+installed as the `hermes` user, never root.
+
+### What the container backend actually buys
+
+Hermes runs every container `--cap-drop ALL --security-opt no-new-privileges
+--pids-limit 256`, mounting only `~/.hermes/sandboxes/docker/<task>/` as `/root` and
+`/workspace` plus a handful of `~/.hermes` cache and skill directories. No Docker
+socket, no `.env`, no `state.db`, no host filesystem.
+
+That is also why the approval settings above are close to decoration here: under a
+container backend Hermes **skips the dangerous-command approval stack entirely**,
+deliberately — the container is the boundary, so there is no prompt to answer and
+nothing it runs reaches the host. They matter again if the backend is ever moved
+back to `local`.
+
+The `hermes` user is in the `docker` group, which is root-equivalent *on the host*.
+The agent never reaches it: its shell is inside the container, and no socket is
+mounted there. Rootless Docker would close the gap for a container escape too, at the
+cost of a userns AppArmor profile on noble — worth it if this ever has to hold against
+a hostile agent rather than a wrong one.
+
+### Two things that break silently without the daemon config
+
+1. **DNS.** Containers inherit the host `resolv.conf` unless it points at a loopback
+   resolver — which noble's `systemd-resolved` does. Docker then substitutes its own
+   public defaults (8.8.8.8), which the security group has no egress rule for, so every
+   lookup in every container hangs until it times out. `/etc/docker/daemon.json` pins
+   the daemon to the VPC resolver the host is actually using.
+2. **Log growth.** The default `json-file` driver never rotates, on a 30GB root volume.
+   Capped at 10MB × 3 per container.
+
+Verification, all of it run by the install script itself except the last:
+
+```sh
+docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}' \
+  $(docker ps -q | head -1)     # 2147483648 [ALL] [no-new-privileges]
+
+hermes -z 'Use the terminal tool to run: cat /etc/hostname && id -un. Raw output only.'
+# a container ID and `root` — NOT ip-172-31-x-x and `hermes`
+```
+
+The sandbox image (`nikolaik/python-nodejs:python3.11-nodejs20`, ~1GB) is pulled at
+install time so the first agent command does not stall on it, and a `getent hosts`
+inside a throwaway container is the install's own check on the DNS fix. Disk after the
+pull: 7.4GB of 29GB.
+
 ### Rebuilding this box
 
 `terraform apply` on an empty account reaches a working agent with no manual steps —
@@ -216,7 +282,7 @@ it *yours*:
 |---|---|---|
 | `hermes-agent/`, `node/`, `bin/` | ~1.25GB | rebuilt by the installer |
 | `skills/` | 3.9MB | 60 bundled skills, re-synced by the installer |
-| `config.yaml` | 141 real lines | all shipped defaults bar `model.default` |
+| `config.yaml` | 141 real lines | shipped defaults bar the five keys Phase 2/3 set |
 | `state.db`, `memories/`, `sessions/`, `cron/`, `SOUL.md` | ~300KB | **irreplaceable** |
 
 So the whole irreplaceable surface is a few hundred KB, and nothing yet backs it up —
@@ -238,10 +304,9 @@ and it protects against `terraform destroy`, not against a rebuild.
 - Boot creates a non-root `hermes` service user with linger enabled; Hermes installs
   under that user (see Phase 2 above). `unattended-upgrades` needs no setup — the
   Ubuntu cloud image ships it enabled.
-- **`terminal.backend` is still `local`.** Phase 2 stops at a verified single query;
-  nothing is listening and no gateway is installed, so the agent only runs when someone
-  starts it by hand. Phase 3 switches the backend to `docker` — do that before Phase 4
-  connects it to Slack, not after.
+- **`terminal.backend` is `docker` (Phase 3).** Nothing is listening and no gateway is
+  installed yet, so the agent still only runs when someone starts it by hand — but its
+  shell is already in a container, which is the thing Phase 4 must not be done without.
 - The root volume has `delete_on_termination = false`. `terraform destroy` leaves the
   volume behind on purpose — it holds `~/.hermes`. Delete it manually when you mean to.
 - Egress includes TCP 80 and UDP 53 beyond the plan's 443/41641: Ubuntu's arm64 apt

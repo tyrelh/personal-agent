@@ -41,7 +41,7 @@ loginctl enable-linger hermes
 systemctl disable --now ssh.socket ssh.service || true
 systemctl mask ssh.socket ssh.service
 
-# --- Phase 2 ----------------------------------------------------------------
+# --- Phases 2 and 3 ---------------------------------------------------------
 # install_hermes.sh, injected verbatim by terraform's templatefile(). It lands on
 # disk as well as running, so it stays re-runnable by hand later (FORCE=1 to
 # reinstall) without going near cloud-init.
