@@ -1,9 +1,8 @@
 # --- Secret -------------------------------------------------------------
-# Container only. The version (actual key material) is loaded once by CLI so no
-# secret value ever lands in state. See README.
-resource "aws_secretsmanager_secret" "hermes" {
-  name        = "hermes"
-  description = "Hermes agent env blob: LLM keys, Slack tokens, Tailscale auth key"
+# Created by hand outside terraform (see README) so no key material ever lands in
+# state. Terraform only reads its ARN to scope the instance role.
+data "aws_secretsmanager_secret" "hermes" {
+  name = "hermes"
 }
 
 # --- IAM ----------------------------------------------------------------
@@ -34,7 +33,7 @@ resource "aws_iam_role_policy" "read_secret" {
     Statement = [{
       Effect   = "Allow"
       Action   = "secretsmanager:GetSecretValue"
-      Resource = aws_secretsmanager_secret.hermes.arn
+      Resource = data.aws_secretsmanager_secret.hermes.arn
     }]
   })
 }
@@ -118,7 +117,7 @@ resource "aws_instance" "hermes" {
   # Changing this does NOT replace the instance (user_data_replace_on_change
   # defaults false) — cloud-init only runs it on first boot. Rebuild deliberately.
   user_data = templatefile("${path.module}/user_data.sh", {
-    secret_id = aws_secretsmanager_secret.hermes.name
+    secret_id = data.aws_secretsmanager_secret.hermes.name
     region    = data.aws_region.current.region
   })
 
@@ -161,5 +160,5 @@ output "public_ip" {
 }
 
 output "secret_arn" {
-  value = aws_secretsmanager_secret.hermes.arn
+  value = data.aws_secretsmanager_secret.hermes.arn
 }
