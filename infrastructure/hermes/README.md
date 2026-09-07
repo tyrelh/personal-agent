@@ -531,6 +531,23 @@ second one:
 SYNC_MODE=pull-only ./deploy.sh obsidian
 ```
 
+### Telling the agent it has a vault
+
+Mounting the vault is not enough. Nothing in the agent's context mentions it, so asked
+"where are my notes" it has no reason to go looking — which is exactly what happened the
+first time. `install_obsidian.sh` writes a block into `~/.hermes/AGENTS.md`, which Hermes
+auto-injects into every session alongside `SOUL.md` and memory.
+
+It has to be `~/.hermes/AGENTS.md`, not `~/AGENTS.md`: injection reads the directory the
+process runs from and **does not walk up the tree**, and the gateway's
+`WorkingDirectory` is `~/.hermes`. Verified both ways — a sentinel fact at `~/AGENTS.md`
+is invisible to the gateway, the same fact at `~/.hermes/AGENTS.md` comes back without a
+tool call.
+
+The block is delimited and rewritten on every run, so anything else in that file
+survives. Its wording follows `SYNC_MODE`, so under `pull-only` the agent is told the
+mount is read-only rather than being left to discover it by failing a write.
+
 ### How the agent actually sees it
 
 Phase 3 put the agent's shell in a container that mounts only its own sandbox directory,

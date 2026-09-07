@@ -297,4 +297,55 @@ got_rw=$(as_hermes docker inspect -f "$tmpl" "$container")
   exit 1
 }
 
+# --- 8. tell the agent the vault exists -------------------------------------
+# Mounting it is not enough: nothing in the agent's context mentions a vault, so asked
+# "where are my notes" it has no reason to look. AGENTS.md is auto-injected into every
+# session (alongside SOUL.md and memory), which makes it the place to say so.
+#
+# It has to sit in the directory the hermes process actually runs from, and injection
+# does NOT walk up the tree — verified: a file at ~/AGENTS.md is invisible to the gateway,
+# whose WorkingDirectory is ~/.hermes. So this goes in ~/.hermes, not the home directory.
+#
+# Written as a delimited block that is stripped and re-added on each run, so anything else
+# in the file — the user's own instructions, a later phase's — survives.
+agents_md="$HERMES_HOME/.hermes/AGENTS.md"
+block_begin="<!-- BEGIN hermes-obsidian (managed by install_obsidian.sh) -->"
+block_end="<!-- END hermes-obsidian -->"
+
+if [ "$SYNC_MODE" = "bidirectional" ]; then
+  writes="Files you create or edit there sync to every device on the account within
+seconds, so treat it as the user's live notes, not a scratch directory."
+else
+  writes="The mount is read-only ($SYNC_MODE): you can read the notes but not change
+them, and a write will fail rather than propagate."
+fi
+
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+if [ -f "$agents_md" ]; then
+  awk -v b="$block_begin" -v e="$block_end" '
+    $0 == b { skip = 1 } !skip { print } $0 == e { skip = 0 }
+  ' "$agents_md" > "$tmp"
+fi
+cat >> "$tmp" <<AGENTS_EOF
+$block_begin
+## Obsidian vault
+
+The user's Obsidian vault "$OBSIDIAN_VAULT" is mounted in your sandbox at
+\`$CONTAINER_PATH\`. It is a real Obsidian vault kept in sync by the headless Sync
+client, so it is the same notes the user reads on their phone and laptop.
+
+$writes
+
+Read \`$CONTAINER_PATH/AGENTS.md\` if it exists — it holds the user's own conventions for
+how the vault is organised.
+$block_end
+AGENTS_EOF
+
+echo "==> telling the agent about the vault in ~/.hermes/AGENTS.md"
+mv "$tmp" "$agents_md"
+trap - EXIT
+chown "$HERMES_USER:$HERMES_USER" "$agents_md"
+chmod 644 "$agents_md"
+
 echo "==> vault ready at $VAULT_DIR ($CONTAINER_PATH in the sandbox, $SYNC_MODE)"
