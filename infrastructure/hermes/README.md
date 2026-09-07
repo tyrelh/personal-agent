@@ -61,7 +61,10 @@ To rotate later, same thing with `put-secret-value --secret-id hermes`.
   "OBSIDIAN_EMAIL": "",
   "OBSIDIAN_PASSWORD": "",
   "OBSIDIAN_VAULT": "",
-  "OBSIDIAN_VAULT_PASSWORD": ""
+  "OBSIDIAN_VAULT_PASSWORD": "",
+  "HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "",
+  "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD": "",
+  "HERMES_DASHBOARD_BASIC_AUTH_SECRET": ""
 }
 ```
 
@@ -435,6 +438,152 @@ that is Phase 5. Until it lands, replacing this instance loses the agent's memor
 though the install reproduces perfectly. The root volume's
 `delete_on_termination = false` is the only thing standing in for a backup right now,
 and it protects against `terraform destroy`, not against a rebuild.
+
+## Dashboard
+
+Hermes' web UI — config, keys, sessions, chat — on the tailnet and nowhere else. Section
+8 of `install_hermes.sh`, so it deploys like everything above it: `./deploy.sh hermes`.
+A no-op until the dashboard credentials are in the secret, like the Phase 4 gateway, and
+a teardown if they ever leave it.
+
+Three parts:
+
+```
+hermes binds 127.0.0.1:9119  ←  tailscale serve proxies the tailnet name at it
+                                dashboard.public_url declares that name
+```
+
+The security group is untouched — it still has no ingress rule of any kind, because
+nothing arrives that way. `tailscale serve` config lives in tailscaled's own state, so it
+survives a reboot without a unit of its own.
+
+The third part is not bookkeeping. It is what makes the first two work, and it is why
+there is a password:
+
+- The Host-header middleware answers `400 Invalid Host header` to any request whose Host
+  is not the interface hermes bound to. A proxied `hermes.tail16ed35.ts.net` is exactly
+  that, so without `dashboard.public_url` the tunnel connects and every request bounces
+  (verified on the box: 400 through the tailnet, 200 on loopback).
+- A non-loopback `public_url` engages the auth gate **even on a loopback bind**, and the
+  gate refuses to bind at all when no auth provider is registered — it exits with
+  "Refusing to bind dashboard to 127.0.0.1 … no auth providers are registered".
+
+So the one key that permits the exposure also demands the login, and `--insecure` cannot
+buy its way out: it has been a no-op since the June 2026 hardening. There is no
+unauthenticated public dashboard to configure.
+
+**The unit runs `hermes dashboard --no-open`, not `hermes serve`.** Same server, but
+`serve` sets `HERMES_SERVE_HEADLESS` and leaves the SPA unmounted — a backend for the
+desktop app, with no web UI at any path (`/login` still renders, which makes this an easy
+half hour to lose). `dashboard` also rebuilds the frontend when the source content hash
+moves, which is what keeps a `hermes update` from silently serving a stale bundle.
+
+That build is `npm install` + `tsc -b && vite build`, about two minutes on this box, and
+it happens on the *first start of the unit* — so `install_hermes.sh` waits on the port
+rather than on `systemctl`, which calls a `Type=simple` unit started the moment it forks.
+Later starts skip the build against a stamp in `~/.hermes/web-ui-build-stamp.json`.
+
+### `hermes update` and the unit
+
+`hermes update` checks out new code and then restarts the runtimes it manages, so that
+nothing keeps serving the pre-update build. It runs as the `hermes` user, and the
+dashboard is a *system* unit — so its restart step used to end here:
+
+```
+✗ failed to restart hermes-dashboard.service
+  systemctl restart …: Interactive authentication required.
+  sudo -n systemctl restart …: sudo: a password is required
+```
+
+which leaves the new backend paired with the old frontend bundle until someone SSHes in
+as root. `install_hermes.sh` therefore ships one sudoers line beside the unit:
+
+```
+hermes ALL=(root) NOPASSWD: /usr/bin/systemctl restart hermes-dashboard.service, …
+```
+
+Restarting a root-owned unit in `/etc/systemd/system` is not a way onto the rest of the
+box, and it is the whole grant — no other command, no other unit. It is written through
+a temp file that `visudo -c` has to accept first, because a malformed file in
+`sudoers.d` breaks *every* sudo on the box, and the teardown branch removes it along
+with the unit.
+
+If you hit that error on a box deployed before this, restart it by hand once and
+re-deploy to install the rule:
+
+```sh
+ssh root@hermes systemctl restart hermes-dashboard
+./deploy.sh hermes
+```
+
+### Credentials
+
+Three keys, read-modify-write as in Phase 4. `hermes-render-env` copies them into
+`~/.hermes/.env` like every other key, and the bundled `basic` dashboard-auth plugin
+reads them from there:
+
+| Key | |
+|---|---|
+| `HERMES_DASHBOARD_BASIC_AUTH_USERNAME` | Required. Its absence is what makes the whole section a no-op. |
+| `HERMES_DASHBOARD_BASIC_AUTH_PASSWORD` | Required, plaintext. The plugin hashes it (stdlib scrypt) at startup. |
+| `HERMES_DASHBOARD_BASIC_AUTH_SECRET` | Session-token signing key, `openssl rand -base64 32`. Optional: without it hermes generates one per process, and every restart logs everyone out. |
+
+The plugin also accepts a precomputed `…_PASSWORD_HASH`, and this repo does not use it.
+It would keep the plaintext out of the secret and out of `~/.hermes/.env` — but every
+other key in that file is an API token worth more than a dashboard login, so a hash here
+protects nothing the file does not already hold, and it costs a hashing step on the box
+every time the password changes.
+
+```sh
+aws secretsmanager get-secret-value --region ca-west-1 --secret-id hermes \
+  --query SecretString --output text \
+  | jq '.HERMES_DASHBOARD_BASIC_AUTH_USERNAME="tyrel"
+        | .HERMES_DASHBOARD_BASIC_AUTH_PASSWORD="…"
+        | .HERMES_DASHBOARD_BASIC_AUTH_SECRET="…"' \
+  > hermes.json
+aws secretsmanager put-secret-value --region ca-west-1 --secret-id hermes \
+  --secret-string file://hermes.json
+rm hermes.json
+```
+
+Then `./deploy.sh hermes`. Rotation is the same as the gateway's — update the secret and
+restart, because `ExecStartPre` re-renders `.env` on every start:
+
+```sh
+ssh root@hermes systemctl restart hermes-dashboard
+```
+
+Set the username without the password and the install refuses rather than handing you a
+server that crash-loops on the auth gate. Remove the username and a later run disables
+the unit, deletes it, switches the serve config off and unsets `public_url` — otherwise
+`Restart=always` would grind against a gate that can no longer be satisfied.
+
+### http today, https when the tailnet says so
+
+`tailscale serve`'s default mode is https:443, which needs a cert, which the tailnet only
+issues once **HTTPS Certificates** is enabled in the admin console. It is off today, so
+the installer reads `CertDomains` from `tailscale status --json`, finds nothing, and
+serves http:80 instead — announcing that it did. The hop is still inside WireGuard, and
+the auth cookies drop their `__Host-`/`Secure` prefixes to match the scheme.
+
+Switch the feature on in the admin console, re-run `./deploy.sh hermes`, and the same
+code picks https:443 and the prefixed cookies.
+
+### Verifying
+
+```sh
+ssh root@hermes 'systemctl status hermes-dashboard --no-pager'
+ssh root@hermes 'journalctl -u hermes-dashboard -n 50 --no-pager'
+ssh root@hermes tailscale serve status
+```
+
+| Check | Expect |
+|---|---|
+| `curl -o /dev/null -w '%{http_code}' http://hermes.tail16ed35.ts.net/login` | `200` |
+| Same URL for `/` while logged out | `302` to `/login` |
+| Same, from a device *off* the tailnet | nothing — no route, no ingress rule |
+| A wrong password | `401` |
+| `sudo -u hermes curl 127.0.0.1:9119/` with `public_url` unset | `200`, unauthenticated — the local-only mode, and the reason `public_url` is what gates |
 
 ## Obsidian vault
 
