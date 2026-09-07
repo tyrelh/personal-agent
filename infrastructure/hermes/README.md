@@ -491,6 +491,12 @@ Or hand a fresh code to a single run: `OBSIDIAN_MFA=123456 ./deploy.sh obsidian`
 The probe is `ob sync-list-remote`, not `ob login` — the latter exits 0 whether or not an
 account is logged in, so it cannot answer the question.
 
+**Log in as `root`, not as `hermes`.** The daemon runs as root (see above), and it is
+root's session it uses. A login as the `hermes` user does nothing for it and leaves an
+Obsidian account credential sitting in the agent's own home directory —
+`install_obsidian.sh` warns if it finds one. Clear it with
+`sudo -u hermes -H ob logout`.
+
 **The `OBSIDIAN_*` keys never reach `~/.hermes/.env`** — `hermes-render-env`'s denylist
 drops them alongside `TAILSCALE_AUTH_KEY`, and `install_obsidian.sh` reads them from
 Secrets Manager directly instead. The reasoning is in the comment on that filter.

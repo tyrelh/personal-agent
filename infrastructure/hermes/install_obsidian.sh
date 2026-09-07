@@ -127,6 +127,16 @@ LOGIN_HELP_EOF
 fi
 unset OBSIDIAN_EMAIL OBSIDIAN_PASSWORD
 
+# Running as root is what keeps the agent user from ever holding an Obsidian credential,
+# and nothing enforces that — an `ob login` run as the wrong user is an easy mistake and
+# leaves a token sitting in the agent's own home. Warn rather than act: clearing somebody
+# else's session without asking is worse than telling them it is there.
+if [ -e "$HERMES_HOME/.config/obsidian-headless/auth_token" ]; then
+  echo "WARNING: $HERMES_USER holds an Obsidian session at ~/.config/obsidian-headless." >&2
+  echo "         That is an account credential inside the agent's home. Clear it with:" >&2
+  echo "           sudo -u $HERMES_USER -H ob logout" >&2
+fi
+
 # --- 4. vault ----------------------------------------------------------------
 # Root-owned, and that is what makes the ownership work out: the sandbox container
 # runs as root, so files the agent creates in the mount land root-owned on the host,
