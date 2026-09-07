@@ -42,9 +42,15 @@ deploy() { # deploy <local file> <remote name>
   echo "==> $src -> $HOST:$dest"
   ssh "$HOST" "cat > $dest.new && chmod 755 $dest.new && mv $dest.new $dest" < "$src"
   echo "==> running $dest"
-  # -t so the remote script's progress arrives as it happens rather than at the end;
-  # these take ten minutes on a fresh box.
-  ssh -t "$HOST" "$(remote_env)$dest"
+  # A TTY only when there is one to pass through: it keeps apt and npm printing progress
+  # on a ten-minute install, but asking for one from a script or a CI job just earns a
+  # "Pseudo-terminal will not be allocated" warning on every run.
+  # A plain string, not an array: macOS ships bash 3.2, where "${arr[@]}" on an empty
+  # array trips `set -u`. Unquoted on purpose so empty expands to no argument at all.
+  local tty=""
+  [ -t 0 ] && tty="-t"
+  # shellcheck disable=SC2086
+  ssh $tty "$HOST" "$(remote_env)$dest"
 }
 
 case "${1:-all}" in
