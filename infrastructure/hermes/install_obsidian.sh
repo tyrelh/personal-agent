@@ -153,6 +153,15 @@ echo "==> sync mode: $SYNC_MODE"
 "$OB" sync-config --path "$VAULT_DIR" --mode "$SYNC_MODE" --json >/dev/null
 
 # --- 5. the sync unit --------------------------------------------------------
+# Stop the daemon before the one-shot sync below. The client refuses two sync instances
+# for the same vault, so on a re-run the one-shot would fail with "Another sync instance
+# is already running" instead of checking anything. It gets started again at the end of
+# this section either way.
+if systemctl cat obsidian-sync >/dev/null 2>&1; then
+  echo "==> stopping obsidian-sync for the one-shot check"
+  systemctl stop obsidian-sync
+fi
+
 # One-shot `ob sync` first: it is the check that the login and the E2EE password are
 # both right, and it fails loudly here instead of into journalctl. It also means the
 # vault has content before the agent can look at it.
@@ -202,53 +211,80 @@ mount="$VAULT_DIR:$CONTAINER_PATH$mount_opts"
 # configured, and dropping them here would be a silent regression. Any stale entry for
 # this same host path is dropped first, so flipping SYNC_MODE rewrites the mount
 # instead of leaving two conflicting ones.
-existing=$(as_hermes bash -lc 'hermes config get terminal.docker_volumes' 2>/dev/null | tr -d '\r' || true)
-case "$(printf '%s' "$existing" | tr -d '[:space:]')" in
-  ''|null) existing='[]' ;;
-  *) # Refuse rather than guess. Resetting the list on an unrecognised format would
-     # silently delete mounts somebody added by hand — which is the exact failure this
-     # merge exists to avoid.
-     jq -e 'type == "array" and all(type == "string")' >/dev/null 2>&1 <<<"$existing" || {
-       echo "terminal.docker_volumes is not a JSON array of strings — merge by hand:" >&2
-       printf '%s\n' "$existing" >&2
-       exit 1
-     } ;;
-esac
+# `hermes config get` prints a YAML block list — one "- entry" per line — not JSON, and
+# prints nothing at all for a key that is not set.
+raw=$(as_hermes bash -lc 'hermes config get terminal.docker_volumes' 2>/dev/null | tr -d '\r' || true)
+if [ -z "$(printf '%s' "$raw" | tr -d '[:space:]')" ]; then
+  existing='[]'
+else
+  existing=$(printf '%s\n' "$raw" \
+    | sed -n 's/^[[:space:]]*-[[:space:]]*//p' \
+    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" \
+    | jq -Rcs 'split("\n") | map(select(length > 0))')
+  # Refuse rather than guess: output that parsed to nothing is a format this does not
+  # understand, and resetting the list would silently delete mounts added by hand.
+  [ "$(printf '%s' "$existing" | jq 'length')" -gt 0 ] || {
+    echo "could not parse terminal.docker_volumes — add the vault mount by hand:" >&2
+    printf '%s\n' "$raw" >&2
+    exit 1
+  }
+fi
 volumes=$(jq -cn --argjson cur "$existing" --arg p "$VAULT_DIR" --arg m "$mount" \
   '($cur | map(select(startswith($p + ":") | not))) + [$m]')
 
 echo "==> mounting the vault into the sandbox: $mount"
 as_hermes bash -lc "hermes config set terminal.docker_volumes '$volumes'"
 
-# The sandbox container is long-lived, so it keeps the old mount table until it is
-# recreated. Restarting the gateway is what forces that. Skipped when there is no
-# gateway yet (Phase 4 not done), because then no container is running anyway.
+# The gateway reads config into memory at start, so it needs a restart to know about the
+# new mount at all. That alone is NOT enough — see section 7. Skipped when there is no
+# gateway yet (Phase 4 not done). The restart drains in-flight turns first, which is what
+# makes it safe to remove containers immediately afterwards.
 if systemctl list-unit-files hermes-gateway.service >/dev/null 2>&1 &&
    systemctl is-active --quiet hermes-gateway; then
-  echo "==> restarting the gateway so the sandbox picks up the mount"
+  echo "==> restarting the gateway so it reloads the mount config"
   "$HERMES_HOME/.local/bin/hermes" gateway restart --system
 fi
 
 # --- 7. verify ---------------------------------------------------------------
-# Not just "the unit is up": that the client thinks the vault is linked, and that the
-# mount is actually visible from inside a sandbox container with the expected
-# writability. The container check is the only one that proves the agent can use it.
 echo "==> verifying"
 "$OB" sync-status --path "$VAULT_DIR"
 
-# The container reports what the mount actually is; the shell decides whether that is
-# what the mode asked for. The rm runs on both paths — if a supposedly read-only mount
-# turns out writable, the check has to fail *and* not leave a file to sync everywhere.
-expect=ro
-[ "$SYNC_MODE" != "bidirectional" ] || expect=rw
+# The sandbox container is long-lived (terminal.container_persistent is true) and keeps
+# whatever mount table it was created with. Setting terminal.docker_volumes does nothing
+# to a running box, and neither does restarting the gateway — only removing the container
+# does, and hermes builds a fresh one on the next tool call.
 image=$(as_hermes bash -lc "hermes config get terminal.docker_image")
-got=$(as_hermes docker run --rm -v "$mount" "$image" sh -c "
-  [ -d $CONTAINER_PATH ] || { echo absent; exit 0; }
-  if touch $CONTAINER_PATH/.hermes-mount-check 2>/dev/null; then
-    rm -f $CONTAINER_PATH/.hermes-mount-check
-    echo rw
-  else
-    echo ro
-  fi")
-[ "$got" = "$expect" ] || { echo "vault mount is '$got' inside the sandbox, expected '$expect'" >&2; exit 1; }
+stale=$(as_hermes docker ps -aq --filter "name=^hermes-" --filter "ancestor=$image")
+if [ -n "$stale" ]; then
+  echo "==> removing the stale sandbox container so the mount table is rebuilt"
+  # shellcheck disable=SC2086 -- deliberately unquoted: this is a list of ids
+  as_hermes docker rm -f $stale >/dev/null
+fi
+
+# One real agent tool call to force a container into existence, then assert on Docker's
+# own mount table.
+#
+# The check goes through the agent, not a throwaway `docker run -v "$mount"`. Mounting the
+# directory by hand only proves Docker can do it; it says nothing about whether hermes
+# applies terminal.docker_volumes to the container the agent actually gets. The earlier
+# version of this script did the throwaway version, passed, and left a box where the
+# vault was invisible to the agent.
+echo "==> forcing a fresh sandbox container"
+as_hermes bash -lc "hermes -z 'Use the terminal tool to run exactly: ls $CONTAINER_PATH | head -1. Reply with the raw output only.'" >/dev/null
+
+container=$(as_hermes docker ps -q --filter "name=^hermes-" --filter "ancestor=$image" | head -1)
+[ -n "$container" ] || { echo "no sandbox container exists after an agent tool call" >&2; exit 1; }
+
+# rw=true is what a bidirectional mount must report; :ro must come back false.
+expect_rw=false
+[ "$SYNC_MODE" != "bidirectional" ] || expect_rw=true
+tmpl='{{range .Mounts}}{{if eq .Destination "'"$CONTAINER_PATH"'"}}{{.RW}}{{end}}{{end}}'
+got_rw=$(as_hermes docker inspect -f "$tmpl" "$container")
+
+[ -n "$got_rw" ] || { echo "$CONTAINER_PATH is not mounted in the sandbox container" >&2; exit 1; }
+[ "$got_rw" = "$expect_rw" ] || {
+  echo "$CONTAINER_PATH is mounted rw=$got_rw in the sandbox, expected rw=$expect_rw" >&2
+  exit 1
+}
+
 echo "==> vault ready at $VAULT_DIR ($CONTAINER_PATH in the sandbox, $SYNC_MODE)"
