@@ -116,11 +116,11 @@ resource "aws_instance" "hermes" {
 
   # Changing this does NOT replace the instance (user_data_replace_on_change
   # defaults false) — cloud-init only runs it on first boot. Rebuild deliberately.
-  # install_hermes.sh goes through file(), not templatefile() — README Phase 2 says why.
+  # It carries the base OS and Tailscale, nothing else: the install scripts go on over
+  # Tailscale SSH afterwards, via deploy.sh. See the README.
   user_data = templatefile("${path.module}/user_data.sh", {
-    secret_id      = data.aws_secretsmanager_secret.hermes.name
-    region         = data.aws_region.current.region
-    install_hermes = file("${path.module}/install_hermes.sh")
+    secret_id = data.aws_secretsmanager_secret.hermes.name
+    region    = data.aws_region.current.region
   })
 
   credit_specification {
