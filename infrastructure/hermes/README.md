@@ -1,12 +1,20 @@
 # hermes infrastructure
 
-Phase 0 of the Hermes agent plan: state backend, EC2 host, IAM. Phases 1 to 4 —
-base OS, Tailscale, the Hermes install, the sandbox hardening and the Slack gateway —
-run unattended at first boot: `user_data.sh` does the base OS and ends by running
-`install_hermes.sh`, which terraform injects into it. A fresh `terraform apply`
-reaches a verified, container-sandboxed agent connected to Slack, with no manual
-steps — provided the Slack tokens are already in the secret (Phase 4 below; the
-gateway install is skipped when they are not).
+Phase 0 of the Hermes agent plan: state backend, EC2 host, IAM.
+
+Two steps, and the split is the whole design. `terraform apply` builds the box and
+`user_data.sh` gets it onto the tailnet with sshd masked — Phase 1, and nothing more.
+Then `./deploy.sh` copies the install scripts over Tailscale SSH and runs them: Phase 2
+(Hermes), Phase 3 (the Docker sandbox), Phase 4 (the Slack gateway) and the Obsidian
+vault. Both scripts are idempotent, so re-running `deploy.sh` is the normal way to change
+anything above the base OS.
+
+The install scripts used to be injected into user-data. They are not any more: user-data
+is capped at 16KB, runs exactly once per instance-id, and cannot be edited on a running
+box — so an inlined install script is a size ceiling *and* a lie, since editing it does
+nothing until a rebuild while still showing up as a `user_data` diff terraform wants to
+push with a pointless stop/start. Over ssh, the file on disk and the file in git are the
+same thing.
 
 ## Apply
 
@@ -49,15 +57,20 @@ To rotate later, same thing with `put-secret-value --secret-id hermes`.
   "SLACK_ALLOWED_USERS": "",
   "SLACK_HOME_CHANNEL": "",
   "FIRECRAWL_API_KEY": "",
-  "TAILSCALE_AUTH_KEY": ""
+  "TAILSCALE_AUTH_KEY": "",
+  "OBSIDIAN_EMAIL": "",
+  "OBSIDIAN_PASSWORD": "",
+  "OBSIDIAN_VAULT": "",
+  "OBSIDIAN_VAULT_PASSWORD": ""
 }
 ```
 
 Use an ephemeral, pre-authorized, single-use Tailscale auth key.
 
 Keys are copied into `~/.hermes/.env` verbatim by `hermes-render-env`, so their names here
-are the names Hermes reads — with two deliberate exceptions it handles for you,
-`MOONSHOT_API_KEY` and `TAILSCALE_AUTH_KEY`. See Phase 2 below. Empty values are
+are the names Hermes reads — with one deliberate rename it handles for you,
+`MOONSHOT_API_KEY`, and two sets of keys it deletes on the way through,
+`TAILSCALE_AUTH_KEY` and `OBSIDIAN_*`. See Phase 2 below. Empty values are
 skipped rather than rendered as blanks, so the placeholders above are harmless until
 filled; `ANTHROPIC_API_KEY` and `FIRECRAWL_API_KEY` are the ones still empty today.
 
@@ -75,6 +88,44 @@ masks `ssh.socket`/`ssh.service`, so nothing listens on port 22 outside the tail
 ```sh
 ssh root@hermes   # over the tailnet
 ```
+
+## Deploy
+
+Once the box is up and on the tailnet, from this directory:
+
+```sh
+./deploy.sh              # install_hermes.sh, then install_obsidian.sh
+./deploy.sh hermes       # just one of them
+./deploy.sh obsidian
+```
+
+It pipes each script to `/usr/local/sbin/` over ssh and runs it there. Expect ~12 minutes
+the first time, most of it Phase 2's upstream installer. Re-running is the normal case,
+not a repair: an existing Hermes install is skipped, and every env/config/unit step
+converges rather than appending.
+
+Knobs are forwarded to the remote script when set — `FORCE=1`, `HERMES_COMMIT=`,
+`MODEL_DEFAULT=`, `SYNC_MODE=`, `VAULT_DIR=`, `SECRET_ID=`, `REGION=` and the rest listed
+in `deploy.sh`. `HOST=` (default `root@hermes`) points at a different box.
+
+```sh
+FORCE=1 ./deploy.sh hermes                # reinstall Hermes over the top
+SYNC_MODE=pull-only ./deploy.sh obsidian  # make the vault read-only to the agent
+```
+
+Three details worth knowing:
+
+- **It uses `cat >` over ssh, not `scp`.** Tailscale SSH does implement sftp, but it has
+  broken before ([tailscale#12849](https://github.com/tailscale/tailscale/issues/12849)),
+  and a pipe needs no sftp subsystem, no `scp` binary and no second connection. Each
+  script is written to `<dest>.new` and moved into place, so a dropped connection cannot
+  leave a half-written file at a path about to be executed.
+- **`ssh` does not forward the environment**, so the knobs above go on the remote command
+  line, `printf %q`-quoted.
+- **The scripts still work piped by hand** if you would rather not use `deploy.sh`:
+  `ssh root@hermes 'bash -s' < install_hermes.sh`. They are self-contained for exactly
+  this reason — `install_hermes.sh` writes `hermes-render-env` itself rather than needing
+  a second file copied over.
 
 ## Changing `user_data.sh`
 
@@ -101,11 +152,11 @@ Three ways to deploy a change, pick by how much state is on the box:
    done for the Phase 1 steps. `user_data.sh` then describes how a *rebuild* would reach the
    current state, not how this box did.
 
-The Phase 2 half is exempt from most of this. `install_hermes.sh` is injected into
-`user_data.sh` but also written to `/usr/local/sbin/hermes-install`, and it is idempotent,
-so a change to it deploys to a running box by re-running that file — no instance
-replacement, no `cloud-init clean`. Only changes to the base-OS half above need one of the
-three routes.
+None of this applies to the install scripts any more — that is the point of deploying
+them over ssh. `./deploy.sh` is the whole story for anything above the base OS. What is
+left in `user_data.sh` is only the part that genuinely has to happen before you can reach
+the box: apt, ufw, Tailscale, the `hermes` user, and masking sshd. Changing *that* still
+needs one of the three routes above, and route 2 is still unsafe for the reasons given.
 
 Note that `user_data_replace_on_change` is unset (defaults false), so a `user_data` diff is
 pushed in place — Terraform stops and starts the instance and cloud-init still ignores the
@@ -113,43 +164,36 @@ new script. Downtime, no effect. Use one of the three above instead.
 
 ## Phase 2 — installing Hermes
 
-`install_hermes.sh` is the whole of it, and **it runs itself at first boot** — terraform
-injects it into `user_data.sh` with `file()`, which appends it as the last thing cloud-init
-does. A new instance comes up with Hermes installed, keyed and verified; there is nothing
-to run by hand.
-
-It is injected with `file()` rather than `templatefile()` on purpose: the script is full of
-shell expansions like `${HERMES_USER:-hermes}`, and only the *outer* template gets scanned
-for interpolation, so an injected value passes through verbatim. Render it through
-`templatefile()` too and terraform would try to resolve those as terraform variables and
-fail the plan.
-
-It also lands on disk at `/usr/local/sbin/hermes-install`, so it stays re-runnable later
-without touching cloud-init — which is how you add something to an already-running box:
+`install_hermes.sh` is the whole of it. `./deploy.sh hermes` copies it to
+`/usr/local/sbin/hermes-install` and runs it; it lives on disk so it stays re-runnable
+there directly:
 
 ```sh
-ssh root@hermes /usr/local/sbin/hermes-install          # converges; skips the install
+ssh root@hermes /usr/local/sbin/hermes-install           # converges; skips the install
 ssh root@hermes 'FORCE=1 /usr/local/sbin/hermes-install' # reinstall over the top
 ```
 
+It never goes through terraform's `templatefile()`: the script is full of shell expansions
+like `${HERMES_USER:-hermes}` that terraform would try to resolve as terraform variables
+and fail the plan on. It reads what it needs from the environment instead, which is what
+`deploy.sh` forwards.
+
 Re-running is safe: an existing install is skipped, and the env and config steps converge
 rather than append. It ends by asking the model a real question, which is the only check
-that proves the key, the base URL and the model slug all line up. Piping it at a bare box
-(`ssh root@hermes 'bash -s' < install_hermes.sh`) also still works — it writes
-`hermes-render-env` itself rather than needing a second file copied over.
+that proves the key, the base URL and the model slug all line up.
 
 Knobs, all optional: `FORCE=1` reinstalls over an existing install, `HERMES_COMMIT=<sha>`
 pins the upstream checkout, `MODEL_DEFAULT=` picks a different model. `SECRET_ID=` and
-`REGION=` point at a different secret — at boot, user_data passes the terraform-templated
-values, and they become the baked-in defaults of the rendered `hermes-render-env`.
+`REGION=` point at a different secret; whichever values a run uses become the baked-in
+defaults of the `hermes-render-env` it writes.
 
-Two consequences of putting this on the boot path, both deliberate:
+Two things about it, both deliberate:
 
-- **It is the last thing `user_data.sh` does.** This is the slow, network-dependent,
+- **It is off the boot path entirely.** This is the slow, network-dependent,
   most-likely-to-fail step — roughly ten minutes, most of it a `curl | bash` of an upstream
-  installer. Everything that makes the box reachable and locked down happens before it, so
-  a failure here still leaves a box on the tailnet with sshd masked that you can SSH in and
-  debug. Expect `cloud-init status --wait` to take ~12 minutes on a fresh instance.
+  installer. Running it over ssh after the box is reachable means a failure is something
+  you watch happen on a box you are already logged into, rather than something you go
+  digging for in `/var/log/cloud-init-output.log` after a silent twelve-minute wait.
 - **The upstream installer is unpinned.** A rebuild six months from now gets whatever
   Hermes ships that day, and this is exactly how the first build broke (`apt install awscli`
   vanished in noble). If a rebuild ever needs to match a known-good box, set
@@ -211,9 +255,8 @@ integrations we do not use.
 
 ## Phase 3 — sandbox the agent's shell
 
-Section 2 of `install_hermes.sh` installs Docker; section 5 points Hermes at it. It is
-the same file as Phase 2, so it deploys the same way — re-run
-`/usr/local/sbin/hermes-install` on a running box, or get it for free on a rebuild.
+Section 2 of `install_hermes.sh` installs Docker; section 5 points Hermes at it. Same
+file as Phase 2, so it deploys the same way: `./deploy.sh hermes`.
 
 Five settings, and one of them is the whole phase:
 
@@ -310,16 +353,15 @@ rm hermes.json
 ```
 
 **3. Re-run the installer.** Section 7 of `install_hermes.sh` is the whole gateway
-install, and it is a no-op until `SLACK_BOT_TOKEN` is in the rendered `.env` — which
-is why it can already sit on the boot path:
+install, and it is a no-op until `SLACK_BOT_TOKEN` is in the rendered `.env`:
 
 ```sh
-ssh root@hermes /usr/local/sbin/hermes-install
+./deploy.sh hermes
 ```
 
 It renders `.env` afresh, installs a **system** unit running as `hermes`, and starts
-it. On a rebuild it runs at first boot with no manual step, because by then the
-tokens are already in the secret.
+it. Nothing about the earlier phases re-runs beyond converging, so this is the only
+step needed once the tokens are in the secret.
 
 Why a system unit and not the `--user` one the CLI defaults to: root can restart it
 over Tailscale SSH, and it starts at boot without depending on the `hermes` user's
@@ -377,9 +419,9 @@ Then, from Slack:
 
 ### Rebuilding this box
 
-`terraform apply` on an empty account reaches a working agent with no manual steps —
-both phases run at first boot. What it does *not* reach is any of the state that makes
-it *yours*:
+`terraform apply` then `./deploy.sh` on an empty account reaches a working agent — two
+commands, both unattended. What they do *not* reach is any of the state that makes it
+*yours*:
 
 | Under `~/.hermes` | | |
 |---|---|---|
@@ -394,18 +436,127 @@ though the install reproduces perfectly. The root volume's
 `delete_on_termination = false` is the only thing standing in for a backup right now,
 and it protects against `terraform destroy`, not against a rebuild.
 
-## Notes
+## Obsidian vault
+
+`install_obsidian.sh`. Puts a real Obsidian vault on the box, kept in sync by
+[obsidian-headless](https://github.com/obsidianmd/obsidian-headless) — the official CLI
+client for Obsidian Sync, no desktop app — and bind-mounts it into the agent's sandbox.
+Notes edited on a phone show up in the agent's filesystem, and (in the default mode) the
+agent's edits show up on the phone.
+
+`./deploy.sh` runs it after `install_hermes.sh`, and it is a no-op when the `OBSIDIAN_*`
+keys are absent from the secret, exactly like the Phase 4 gateway. On its own:
+
+```sh
+./deploy.sh obsidian
+ssh root@hermes /usr/local/sbin/hermes-obsidian-install   # or re-run it in place
+```
+
+Knobs, all optional: `SYNC_MODE=` (below), `VAULT_DIR=` (default `/srv/obsidian`),
+`CONTAINER_PATH=` (default `/workspace/vault`), `OB_VERSION=` and `NODE_MAJOR=`,
+`FORCE=1` to reinstall the client over the top.
+
+### Setting it up
+
+Four values in the secret, read-modify-write as in Phase 4:
+
+```sh
+aws secretsmanager get-secret-value --region ca-west-1 --secret-id hermes \
+  --query SecretString --output text \
+  | jq '.OBSIDIAN_EMAIL="…" | .OBSIDIAN_PASSWORD="…" | .OBSIDIAN_VAULT="My Vault"
+        | .OBSIDIAN_VAULT_PASSWORD="…"' \
+  > hermes.json
+aws secretsmanager put-secret-value --region ca-west-1 --secret-id hermes \
+  --secret-string file://hermes.json
+rm hermes.json
+```
+
+`OBSIDIAN_VAULT` is the remote vault's name or ID as `ob sync-list-remote` reports it.
+`OBSIDIAN_VAULT_PASSWORD` is the end-to-end encryption password and is only needed for an
+E2EE vault — leave it empty otherwise. An active Sync subscription is required.
+
+**Turn 2FA off on the account, or this cannot work.** `ob login` takes `--email` and
+`--password` but prompts for the 2FA code, and a boot script has nobody to ask. The
+script fails at the login step with the client's own message if 2FA is on.
+
+**The `OBSIDIAN_*` keys never reach `~/.hermes/.env`** — `hermes-render-env`'s denylist
+drops them alongside `TAILSCALE_AUTH_KEY`, and `install_obsidian.sh` reads them from
+Secrets Manager directly instead. The reasoning is in the comment on that filter.
+
+**The sync daemon runs as root, and so does the login.** Deliberate, and the one place
+this repo departs from "services run as `hermes`":
+
+- The stored Obsidian session lands in root's home, where the `hermes` user — and
+  anything that escapes the sandbox — cannot read it. The agent reaches the vault
+  through the bind mount and nothing else.
+- The sandbox container runs as root, so files the agent creates in the vault are
+  root-owned on the host. A daemon running as anyone else could upload them but never
+  edit or delete them again — one uid on both sides of the mount avoids the whole
+  problem, and avoids having to turn on `terminal.docker_run_as_host_user` and change
+  what Phase 3 verified.
+
+### Sync mode
+
+| `SYNC_MODE` | Mount | Effect |
+|---|---|---|
+| `bidirectional` (default) | read-write | The agent's edits propagate to every device on the account. |
+| `pull-only` | `:ro` | Vault is read-only to the agent; local changes ignored. |
+| `mirror-remote` | `:ro` | Same, and any local change is reverted. |
+
+Set on every run, not just at setup, so it converges rather than drifting. Under
+`pull-only`/`mirror-remote` the bind mount is made `:ro` too — a mount the agent can
+write to but whose writes are silently discarded is worse than one it is told is
+read-only. Flipping the mode later rewrites the existing mount rather than adding a
+second one:
+
+```sh
+SYNC_MODE=pull-only ./deploy.sh obsidian
+```
+
+### How the agent actually sees it
+
+Phase 3 put the agent's shell in a container that mounts only its own sandbox directory,
+so a vault sitting on the host filesystem is invisible to it. `terminal.docker_volumes`
+is the bind mount, and the script merges its entry into whatever is already there rather
+than replacing the list — if that key is ever something other than a JSON array of
+strings it refuses and asks you to merge by hand, because resetting it would silently
+delete somebody's hand-added mount.
+
+The sandbox container is long-lived and keeps its old mount table until it is recreated,
+so the script restarts the gateway (when there is one) to force that.
+
+### Verifying
+
+The script checks all of this itself except the last row — a one-shot `ob sync` before
+installing the unit (which is what proves the login and the E2EE password), then
+`sync-status`, then a throwaway container that touches a file in the mount to prove the
+agent-side path and its writability.
+
+```sh
+ssh root@hermes 'systemctl status obsidian-sync --no-pager'
+ssh root@hermes 'journalctl -u obsidian-sync -n 50 --no-pager'
+ssh root@hermes 'ls /srv/obsidian'
+ssh root@hermes 'ob sync-status --path /srv/obsidian'
+```
+
+| Do this | Expect |
+|---|---|
+| Ask the agent in Slack to `ls /workspace/vault` | your notes |
+| Edit a note on a phone, wait | it changes on the box within seconds |
+| Ask the agent to write a note there (`bidirectional`) | it appears on your other devices |
+
+### Notes
 
 - **The running box has never executed the committed `user_data.sh`.** It booted from an
   earlier version that ran `apt-get install awscli`, which noble no longer ships; that
   failed before Tailscale, so `cloud-init status` still reports `error` and the Phase 1
-  steps were applied by hand. Phase 2 was likewise applied by hand, then folded into
-  `install_hermes.sh`. Both halves are correct and a rebuild runs them clean — but the
-  boot path itself is unproven until an instance is actually replaced. The pieces have
-  been exercised individually (`install_hermes.sh` re-run against the live box, the
-  rendered template syntax-checked), which is not the same as a green first boot.
-- Boot creates a non-root `hermes` service user with linger enabled; Hermes installs
-  under that user (see Phase 2 above). `unattended-upgrades` needs no setup — the
+  steps were applied by hand. `user_data.sh` is correct and a rebuild runs it clean, but
+  it is unproven until an instance is actually replaced — the rendered template has only
+  been syntax-checked. The install scripts are the opposite: they have been run against
+  the live box repeatedly, which is now the only way they ever run.
+- Boot creates a non-root `hermes` service user with linger enabled, which is why that
+  part stayed in `user_data.sh` — `install_hermes.sh` refuses to run without it. Hermes
+  installs under that user (see Phase 2 above). `unattended-upgrades` needs no setup — the
   Ubuntu cloud image ships it enabled.
 - **`terminal.backend` is `docker` (Phase 3).** Nothing is listening and no gateway is
   installed yet, so the agent still only runs when someone starts it by hand — but its

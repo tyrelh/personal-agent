@@ -1,11 +1,12 @@
 #!/bin/bash
 # Phase 2 — install and configure Hermes on a fresh box.
 #
-# Run as root over Tailscale SSH; it drops to the `hermes` user for everything that
-# is not apt. Self-contained on purpose, so it works piped at a box that has nothing
-# on it yet. Safe to re-run: an existing install is left alone unless FORCE=1, and
-# the env/config steps converge rather than append.
+# Run as root on the box, copied there and started by ./deploy.sh; it drops to the
+# `hermes` user for everything that is not apt. Self-contained on purpose, so it also
+# works piped at a box that has nothing on it yet. Safe to re-run: an existing install is
+# left alone unless FORCE=1, and the env/config steps converge rather than append.
 #
+#   ./deploy.sh hermes
 #   ssh root@hermes 'bash -s' < install_hermes.sh
 #
 # Pin a version with HERMES_COMMIT=<sha> (the installer's --commit; it refuses to
@@ -16,8 +17,8 @@ HERMES_USER="${HERMES_USER:-hermes}"
 HERMES_HOME="/home/$HERMES_USER"
 MODEL_DEFAULT="${MODEL_DEFAULT:-kimi/kimi-k3}"
 FORCE="${FORCE:-0}"
-# At boot, user_data.sh passes the terraform-templated values for these two; the
-# literals are only the fallback for piping this at a bare box by hand.
+# The literals are the normal case now that nothing templates this script; deploy.sh
+# forwards SECRET_ID/REGION only when they are set in its own environment.
 SECRET_ID="${SECRET_ID:-hermes}"
 REGION="${REGION:-ca-west-1}"
 
@@ -92,9 +93,9 @@ fi
 # rotation is then "update the secret, restart the unit". Written here rather than
 # shipped as a second file so this script stays pipeable at a bare box.
 echo "==> installing hermes-render-env"
-# The defaults are baked in from this script's own SECRET_ID/REGION, so the
-# terraform-templated values passed at boot become the on-disk defaults — one
-# source of truth. A per-run SECRET_ID=/REGION= override still wins.
+# The defaults are baked in from this script's own SECRET_ID/REGION, so whatever this
+# run used becomes the on-disk default — one source of truth. A per-run
+# SECRET_ID=/REGION= override still wins.
 cat > /usr/local/bin/hermes-render-env <<RENDER_HEAD_EOF
 #!/bin/bash
 # Renders the hermes secret into ~/.hermes/.env.
@@ -112,16 +113,21 @@ ENV_FILE="$HOME/.hermes/.env"
 tmp=$(mktemp "$ENV_FILE.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
 
-# TAILSCALE_AUTH_KEY is consumed by user-data at boot and is not a Hermes variable;
-# keep it out of a file read by an agent that has shell access. MOONSHOT_API_KEY is
-# the name the key is stored under; Hermes' native Kimi/Moonshot provider reads
-# KIMI_API_KEY. Rename the key in the secret and this clause can go.
+# The first with_entries is the denylist: boot-only secrets that are not Hermes
+# variables and must not reach a file read by an agent with shell access.
+# TAILSCALE_AUTH_KEY is consumed by user-data at boot; the OBSIDIAN_* keys are read
+# from the secret directly by install_obsidian.sh, as root, and are the stronger case —
+# that email and password are access to every vault on the account. Add the next
+# boot-only key or prefix to this one clause.
+#
+# MOONSHOT_API_KEY is the name the key is stored under; Hermes' native Kimi/Moonshot
+# provider reads KIMI_API_KEY. Rename the key in the secret and that clause can go.
 /snap/bin/aws secretsmanager get-secret-value \
   --secret-id "$SECRET_ID" \
   --region "$REGION" \
   --query SecretString --output text \
   | jq -r '
-      del(.TAILSCALE_AUTH_KEY)
+      with_entries(select(.key | . != "TAILSCALE_AUTH_KEY" and (startswith("OBSIDIAN_") | not)))
       | with_entries(if .key == "MOONSHOT_API_KEY" then .key = "KIMI_API_KEY" else . end)
       | to_entries[]
       | select(.value != "")

@@ -41,19 +41,16 @@ loginctl enable-linger hermes
 systemctl disable --now ssh.socket ssh.service || true
 systemctl mask ssh.socket ssh.service
 
-# --- Phases 2 and 3 ---------------------------------------------------------
-# install_hermes.sh, injected verbatim by terraform's templatefile(). It lands on
-# disk as well as running, so it stays re-runnable by hand later (FORCE=1 to
-# reinstall) without going near cloud-init.
+# --- Everything else is deploy.sh ------------------------------------------
+# The install scripts are deliberately NOT here. user-data's only job is to get the box
+# onto the tailnet with sshd masked; the rest arrives over Tailscale SSH afterwards:
 #
-# Deliberately the LAST thing in this file. It is the slow, network-dependent,
-# most-likely-to-fail step — roughly ten minutes, most of it a `curl | bash` of an
-# upstream installer. Everything that makes the box reachable and locked down has
-# already happened above, so if this fails the box still comes up on the tailnet
-# with sshd masked and you can debug it over SSH. Pin the upstream with
-# HERMES_COMMIT=<sha> below if a rebuild ever needs to match this one exactly.
-cat > /usr/local/sbin/hermes-install <<'HERMES_INSTALL_EOF'
-${install_hermes}
-HERMES_INSTALL_EOF
-chmod 755 /usr/local/sbin/hermes-install
-SECRET_ID='${secret_id}' REGION='${region}' /usr/local/sbin/hermes-install
+#   ./deploy.sh
+#
+# Why, rather than injecting them: user-data is capped at 16KB and runs exactly once per
+# instance-id, so an inlined install script is both a size ceiling and a lie — editing it
+# does nothing to a running box, but still shows up as a `user_data` diff that terraform
+# wants to push with a pointless stop/start. Copying them in over ssh means the file on
+# disk and the file in git are the same thing, and re-running is the normal case rather
+# than a rebuild.
+echo "user-data done — box should be on the tailnet. Run ./deploy.sh from the repo next."
