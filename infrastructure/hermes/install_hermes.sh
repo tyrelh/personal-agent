@@ -31,9 +31,10 @@ id "$HERMES_USER" >/dev/null 2>&1 || { echo "no $HERMES_USER user — run user_d
 as_hermes() { cd "$HERMES_HOME" && sudo -u "$HERMES_USER" -H "$@"; }
 
 # --- 1. system packages ------------------------------------------------------
-# The only part of the install needing root, so it happens here and the hermes user
-# never gets sudo. build-essential is required (node-pty compiles); ripgrep and
-# ffmpeg are optional, but the installer only warns and silently degrades without them.
+# The only part of the install needing root, apart from the units in sections 7-8 and
+# the single sudoers line section 8 needs. build-essential is required (node-pty
+# compiles); ripgrep and ffmpeg are optional, but the installer only warns and silently
+# degrades without them.
 echo "==> system packages"
 export DEBIAN_FRONTEND=noninteractive NEEDRESTART_MODE=a
 apt-get update -qq
@@ -237,4 +238,157 @@ DROPIN_EOF
   "$HERMES_HOME/.local/bin/hermes" gateway restart --system
   systemctl is-active --quiet hermes-gateway || { systemctl status --no-pager -l hermes-gateway; exit 1; }
   echo "==> gateway running"
+fi
+
+# --- 8. dashboard ------------------------------------------------------------
+# The web UI on the tailnet and nowhere else: hermes binds loopback, `tailscale
+# serve` is the only thing in front of it, so the security group keeps its empty
+# ingress and TLS is tailscaled's problem rather than this box's.
+#
+# Exposure implies a password here structurally, not by policy. The Host-header
+# middleware rejects anything whose Host is not the bound interface, so the
+# proxied tailnet name only works once it is declared in `dashboard.public_url` —
+# and a non-loopback public_url engages the auth gate, which refuses to start
+# with no auth provider registered. No password in the secret, no dashboard.
+env_val() { sed -n "s/^$1=//p" "$env_file" | head -1; }
+dash_user=$(env_val HERMES_DASHBOARD_BASIC_AUTH_USERNAME)
+if [ -z "$dash_user" ]; then
+  echo "==> no HERMES_DASHBOARD_BASIC_AUTH_USERNAME in the secret — skipping the dashboard"
+  # Converge rather than merely skip. A dashboard from an earlier run would keep
+  # restarting into the auth-gate refusal now that its password has left the
+  # secret — Restart=always plus a config the server refuses to bind is a crash
+  # loop, so pulling the credentials out of the secret has to be a real teardown.
+  # Guarded on our own unit file: a box that never had a dashboard has no serve
+  # config of ours to switch off.
+  if [ -f /etc/systemd/system/hermes-dashboard.service ]; then
+    echo "==> removing the dashboard an earlier run installed"
+    systemctl disable --now -q hermes-dashboard
+    rm -f /etc/systemd/system/hermes-dashboard.service /etc/sudoers.d/hermes-dashboard
+    systemctl daemon-reload
+    tailscale serve --http=80 off >/dev/null 2>&1 || true
+    tailscale serve --https=443 off >/dev/null 2>&1 || true
+    as_hermes bash -lc 'hermes config unset dashboard.public_url' >/dev/null
+  fi
+else
+  # Same fail-closed shape as the gateway's allowlist: half-configured credentials
+  # make the plugin skip registration, and the server then exits at bind time with
+  # "no auth providers are registered" — a startup crash that looks like a bug.
+  # The plaintext password is the one the secret carries; the plugin hashes it at
+  # startup, and `_PASSWORD_HASH` is deliberately unused here — a precomputed hash
+  # buys nothing on a box whose .env already holds every other key in the secret.
+  if [ -z "$(env_val HERMES_DASHBOARD_BASIC_AUTH_PASSWORD)" ]; then
+    echo "HERMES_DASHBOARD_BASIC_AUTH_USERNAME is set but HERMES_DASHBOARD_BASIC_AUTH_PASSWORD is not — refusing to install a dashboard that cannot authenticate" >&2
+    exit 1
+  fi
+
+  ts_name=$(tailscale status --json | jq -r '.Self.DNSName // ""' | sed 's/\.$//')
+  [ -n "$ts_name" ] || { echo "no tailnet name from tailscale status — is this box on the tailnet?" >&2; exit 1; }
+
+  # https is `tailscale serve`'s default mode but needs a cert, which the tailnet
+  # only issues once HTTPS Certificates is switched on in the admin console. When
+  # it is off, http is the honest answer: the hop is still inside WireGuard, and
+  # the auth cookies drop their __Host-/Secure prefixes to match the scheme.
+  if tailscale status --json | jq -e --arg n "$ts_name" '(.CertDomains // []) | index($n)' >/dev/null; then
+    scheme=https
+    serve_flag=--https=443
+  else
+    scheme=http
+    serve_flag=--http=80
+    echo "==> tailnet HTTPS certs are off — serving over http; enable them in the admin console and re-run for TLS"
+  fi
+
+  # Declares the external URL *and* trusts its Host/Origin. One key, because they
+  # are the same fact: this is the name the dashboard is reached by.
+  echo "==> dashboard public URL: $scheme://$ts_name"
+  as_hermes bash -lc "hermes config set dashboard.public_url '$scheme://$ts_name'"
+
+  # No `hermes dashboard install` exists, so the unit is written here. Everything
+  # below the ExecStart mirrors the gateway unit hermes generates for itself —
+  # same interpreter, same environment, same ExecStartPre re-render of .env so
+  # rotating the password is "update the secret, restart the unit".
+  #
+  # `dashboard --no-open`, NOT `serve`: they are the same server, but `serve` sets
+  # HERMES_SERVE_HEADLESS, which leaves the SPA unmounted — a backend for the
+  # desktop app, with no web UI at any path. `dashboard` also builds the frontend
+  # when the source hash moved, which is what keeps this self-healing across a
+  # `hermes update` instead of quietly serving a stale bundle.
+  cat > /etc/systemd/system/hermes-dashboard.service <<UNIT_EOF
+[Unit]
+Description=Hermes Agent Dashboard - web UI behind tailscale serve
+After=network-online.target tailscaled.service
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=$HERMES_USER
+Group=$HERMES_USER
+ExecStartPre=/usr/local/bin/hermes-render-env
+ExecStart=$HERMES_HOME/.hermes/hermes-agent/venv/bin/python -m hermes_cli.main dashboard --no-open --host 127.0.0.1 --port 9119
+WorkingDirectory=$HERMES_HOME/.hermes
+Environment="HOME=$HERMES_HOME"
+Environment="USER=$HERMES_USER"
+Environment="LOGNAME=$HERMES_USER"
+Environment="PATH=$HERMES_HOME/.hermes/node:$HERMES_HOME/.hermes/hermes-agent/venv/bin:$HERMES_HOME/.hermes/hermes-agent/node_modules/.bin:$HERMES_HOME/.hermes/node/bin:$HERMES_HOME/.local/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+Environment="VIRTUAL_ENV=$HERMES_HOME/.hermes/hermes-agent/venv"
+# NOT $HERMES_HOME: that is the unix home, and hermes' HERMES_HOME is the data
+# directory under it. Point this at /home/hermes and the server reads an empty
+# auto-seeded config — no public_url, no credentials, an ungated dashboard and a
+# 400 on every proxied request.
+Environment="HERMES_HOME=$HERMES_HOME/.hermes"
+Environment="HERMES_SUPERVISED_CHILD=1"
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+  # `hermes update` restarts the runtimes it manages, and it runs as the hermes user —
+  # so its `sudo -n systemctl restart hermes-dashboard.service` dies with "a password
+  # is required" and the box keeps serving the pre-update frontend until someone
+  # restarts the unit as root by hand. One sudoers line is what makes `hermes update`
+  # finish on its own.
+  #
+  # Not an escalation: the unit lives in /etc/systemd/system and is root-owned, so this
+  # permits restarting hermes' own dashboard and nothing else. Validated before it
+  # lands — a syntactically broken file in sudoers.d breaks *every* sudo on the box.
+  # Both spellings because sudo matches the argv it is given, not the unit.
+  sudoers=/etc/sudoers.d/hermes-dashboard
+  cat > "$sudoers.tmp" <<SUDOERS_EOF
+$HERMES_USER ALL=(root) NOPASSWD: /usr/bin/systemctl restart hermes-dashboard.service, /usr/bin/systemctl restart hermes-dashboard
+SUDOERS_EOF
+  chmod 440 "$sudoers.tmp"
+  visudo -cqf "$sudoers.tmp" || { echo "generated sudoers file is invalid — not installing it" >&2; rm -f "$sudoers.tmp"; exit 1; }
+  mv "$sudoers.tmp" "$sudoers"
+
+  systemctl daemon-reload
+  systemctl enable -q hermes-dashboard
+  # restart, not start: a re-run that changed public_url or the password has to
+  # take, and the server reads both once at startup.
+  systemctl restart hermes-dashboard
+
+  # The server builds the web UI on start when the source hash moved (`hermes
+  # update` is the usual reason), which is minutes on this box — and it is a
+  # Type=simple unit, so systemd calls it started the moment it forks. Waiting on
+  # the port is the only honest readiness check.
+  echo "==> waiting for the dashboard to answer (a first start builds the web UI — minutes)"
+  ready=0
+  for _ in $(seq 1 120); do
+    if curl -s -o /dev/null --max-time 5 http://127.0.0.1:9119/login; then ready=1; break; fi
+    systemctl is-active --quiet hermes-dashboard || { journalctl -u hermes-dashboard -n 40 --no-pager; exit 1; }
+    sleep 5
+  done
+  [ "$ready" = 1 ] || { echo "dashboard never answered on 127.0.0.1:9119" >&2; journalctl -u hermes-dashboard -n 40 --no-pager; exit 1; }
+
+  # Declarative and stored in tailscaled's own state: re-running with the same
+  # target changes nothing, and it survives a reboot without a unit of its own.
+  tailscale serve --bg "$serve_flag" http://127.0.0.1:9119
+
+  # End to end through tailscaled, which is what proves the Host/Origin trust and
+  # the proxy hop, not just the loopback listener.
+  code=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$scheme://$ts_name/login")
+  [ "$code" = 200 ] || { echo "dashboard reachable on loopback but returned $code via $scheme://$ts_name" >&2; exit 1; }
+  echo "==> dashboard running — $scheme://$ts_name (login as $dash_user)"
 fi
