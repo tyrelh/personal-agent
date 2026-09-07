@@ -475,9 +475,21 @@ rm hermes.json
 `OBSIDIAN_VAULT_PASSWORD` is the end-to-end encryption password and is only needed for an
 E2EE vault — leave it empty otherwise. An active Sync subscription is required.
 
-**Turn 2FA off on the account, or this cannot work.** `ob login` takes `--email` and
-`--password` but prompts for the 2FA code, and a boot script has nobody to ask. The
-script fails at the login step with the client's own message if 2FA is on.
+**2FA needs one interactive login, once.** `ob login` takes `--email`, `--password` and
+`--mfa`, but a code is only valid for about thirty seconds so no unattended run can
+supply one. The session is stored afterwards, and `install_obsidian.sh` probes for it
+before trying to log in — so this is a one-time step, not a per-run problem, and there is
+no reason to turn 2FA off:
+
+```sh
+ssh -t root@hermes ob login              # prompts for email, password and the code
+./deploy.sh obsidian                     # every later run skips the login
+```
+
+Or hand a fresh code to a single run: `OBSIDIAN_MFA=123456 ./deploy.sh obsidian`.
+
+The probe is `ob sync-list-remote`, not `ob login` — the latter exits 0 whether or not an
+account is logged in, so it cannot answer the question.
 
 **The `OBSIDIAN_*` keys never reach `~/.hermes/.env`** — `hermes-render-env`'s denylist
 drops them alongside `TAILSCALE_AUTH_KEY`, and `install_obsidian.sh` reads them from

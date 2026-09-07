@@ -27,6 +27,9 @@ FORCE="${FORCE:-0}"
 # forwards SECRET_ID/REGION only when they are set in its own environment.
 SECRET_ID="${SECRET_ID:-hermes}"
 REGION="${REGION:-ca-west-1}"
+# A 2FA code, when one is needed. Environment only, never the secret: it is valid for
+# about thirty seconds, so storing it would be meaningless.
+OBSIDIAN_MFA="${OBSIDIAN_MFA:-}"
 
 [ "$(id -u)" -eq 0 ] || { echo "run as root" >&2; exit 1; }
 command -v jq >/dev/null || { echo "jq missing — run user_data.sh first" >&2; exit 1; }
@@ -87,19 +90,41 @@ OB=$(command -v ob) || { echo "obsidian-headless installed but 'ob' is not on PA
 # that escapes the sandbox. The agent reaches the vault through the bind mount in
 # section 6 and nothing else.
 #
-# Unconditional, not guarded by a "already logged in?" probe: passing --email and
-# --password is how the client re-authenticates an existing session, so one call
-# converges either way. A probe would have to guess what `ob login --json` reports for
-# a logged-out account, and guessing wrong means a boot that looks fine and then dies
-# at sync-setup.
+# The probe is sync-list-remote, not `ob login`. `ob login` with no arguments is
+# documented as printing account info when a session exists, but it exits 0 with no
+# output when logged *out* too, so it cannot tell you anything. sync-list-remote is a
+# real authenticated call: exit 2 and "No account logged in" when there is no session.
 #
-# 2FA cannot be answered by a boot script — if the account has it on, this fails here
-# with the client's own message and nothing after it runs.
+# Skipping the login when a session already exists is what makes 2FA workable. The
+# session is stored, so an account with 2FA needs exactly one interactive login ever;
+# every run after that is unattended.
+#
+# `ob login` takes no --json (its only options are --email, --password and --mfa), so
+# stdin comes from /dev/null — a prompt then gets EOF and fails instead of hanging.
 # ponytail: the password goes on argv, so it is in /proc/<pid>/cmdline for the life of
 # one command. There is no token or stdin path in the client today; switch to one if
 # it ever lands.
-echo "==> logging in to Obsidian as $OBSIDIAN_EMAIL"
-"$OB" login --email "$OBSIDIAN_EMAIL" --password "$OBSIDIAN_PASSWORD" --json >/dev/null
+if "$OB" sync-list-remote --json </dev/null >/dev/null 2>&1; then
+  echo "==> already logged in to Obsidian"
+else
+  echo "==> logging in to Obsidian as $OBSIDIAN_EMAIL"
+  "$OB" login --email "$OBSIDIAN_EMAIL" --password "$OBSIDIAN_PASSWORD" \
+    ${OBSIDIAN_MFA:+--mfa "$OBSIDIAN_MFA"} </dev/null >/dev/null || {
+    cat >&2 <<'LOGIN_HELP_EOF'
+
+login failed. If the account has 2FA enabled, an unattended run cannot answer it — the
+code is valid for about thirty seconds. The session is stored once you log in, so this is
+a one-time step and every later run skips it:
+
+  ssh -t root@hermes ob login          # prompts for email, password and the code
+
+Or hand a fresh code to this run:
+
+  OBSIDIAN_MFA=123456 ./deploy.sh obsidian
+LOGIN_HELP_EOF
+    exit 1
+  }
+fi
 unset OBSIDIAN_EMAIL OBSIDIAN_PASSWORD
 
 # --- 4. vault ----------------------------------------------------------------

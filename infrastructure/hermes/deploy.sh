@@ -22,7 +22,7 @@ cd "$(dirname "$0")"
 # worth a flag but not obvious enough to be worth guessing at from here.
 FORWARD=(FORCE HERMES_COMMIT MODEL_DEFAULT HERMES_USER
          SECRET_ID REGION
-         OB_VERSION NODE_MAJOR VAULT_DIR CONTAINER_PATH SYNC_MODE)
+         OB_VERSION NODE_MAJOR VAULT_DIR CONTAINER_PATH SYNC_MODE OBSIDIAN_MFA)
 
 remote_env() {
   local name value out=""
