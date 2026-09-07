@@ -1,10 +1,12 @@
 # hermes infrastructure
 
-Phase 0 of the Hermes agent plan: state backend, EC2 host, IAM. Phases 1 to 3 —
-base OS, Tailscale, the Hermes install and the sandbox hardening — run unattended at
-first boot: `user_data.sh` does the base OS and ends by running `install_hermes.sh`,
-which terraform injects into it. A fresh `terraform apply` reaches a verified,
-container-sandboxed agent with no manual steps.
+Phase 0 of the Hermes agent plan: state backend, EC2 host, IAM. Phases 1 to 4 —
+base OS, Tailscale, the Hermes install, the sandbox hardening and the Slack gateway —
+run unattended at first boot: `user_data.sh` does the base OS and ends by running
+`install_hermes.sh`, which terraform injects into it. A fresh `terraform apply`
+reaches a verified, container-sandboxed agent connected to Slack, with no manual
+steps — provided the Slack tokens are already in the secret (Phase 4 below; the
+gateway install is skipped when they are not).
 
 ## Apply
 
@@ -45,6 +47,7 @@ To rotate later, same thing with `put-secret-value --secret-id hermes`.
   "SLACK_BOT_TOKEN": "",
   "SLACK_APP_TOKEN": "",
   "SLACK_ALLOWED_USERS": "",
+  "SLACK_HOME_CHANNEL": "",
   "FIRECRAWL_API_KEY": "",
   "TAILSCALE_AUTH_KEY": ""
 }
@@ -56,7 +59,7 @@ Keys are copied into `~/.hermes/.env` verbatim by `hermes-render-env`, so their 
 are the names Hermes reads — with two deliberate exceptions it handles for you,
 `MOONSHOT_API_KEY` and `TAILSCALE_AUTH_KEY`. See Phase 2 below. Empty values are
 skipped rather than rendered as blanks, so the placeholders above are harmless until
-filled; only `MOONSHOT_API_KEY` and `TAILSCALE_AUTH_KEY` are set today.
+filled; `ANTHROPIC_API_KEY` and `FIRECRAWL_API_KEY` are the ones still empty today.
 
 ## Access
 
@@ -271,6 +274,106 @@ The sandbox image (`nikolaik/python-nodejs:python3.11-nodejs20`, ~1GB) is pulled
 install time so the first agent command does not stall on it, and a `getent hosts`
 inside a throwaway container is the install's own check on the DNS fix. Disk after the
 pull: 7.4GB of 29GB.
+
+## Phase 4 — Slack gateway
+
+Socket Mode: the app dials **out** to Slack over a WebSocket, so the security group
+keeps its zero ingress rules and there is no public URL, no ALB, and no request
+signature to verify.
+
+Three of the five steps are in this repo; the two that are not are a browser and a
+secret, and neither can be.
+
+**1. Create the Slack app (by hand, once).** [api.slack.com/apps](https://api.slack.com/apps)
+→ *Create New App* → *From an app manifest* → paste `slack_app_manifest.yaml`. Use a
+**personal workspace, not Giftbit** — this bot has shell access, which is a different
+risk conversation in a work workspace.
+
+Then, still in the browser:
+
+- *Basic Information* → *App-Level Tokens* → generate one with `connections:write`
+  → that is `SLACK_APP_TOKEN` (`xapp-…`). The manifest cannot create this.
+- *Install App* → install to the workspace → `SLACK_BOT_TOKEN` (`xoxb-…`).
+- Your own member ID: Slack profile → *Copy member ID* (`U…`) → `SLACK_ALLOWED_USERS`.
+
+**2. Put the three values in the secret.** Read-modify-write, because
+`put-secret-value` replaces the whole blob:
+
+```sh
+aws secretsmanager get-secret-value --region ca-west-1 --secret-id hermes \
+  --query SecretString --output text \
+  | jq '.SLACK_BOT_TOKEN="xoxb-…" | .SLACK_APP_TOKEN="xapp-…" | .SLACK_ALLOWED_USERS="U…"' \
+  > hermes.json
+aws secretsmanager put-secret-value --region ca-west-1 --secret-id hermes \
+  --secret-string file://hermes.json
+rm hermes.json
+```
+
+**3. Re-run the installer.** Section 7 of `install_hermes.sh` is the whole gateway
+install, and it is a no-op until `SLACK_BOT_TOKEN` is in the rendered `.env` — which
+is why it can already sit on the boot path:
+
+```sh
+ssh root@hermes /usr/local/sbin/hermes-install
+```
+
+It renders `.env` afresh, installs a **system** unit running as `hermes`, and starts
+it. On a rebuild it runs at first boot with no manual step, because by then the
+tokens are already in the secret.
+
+Why a system unit and not the `--user` one the CLI defaults to: root can restart it
+over Tailscale SSH, and it starts at boot without depending on the `hermes` user's
+linger. It still runs as `hermes` — the plan's "never run the gateway as root" is
+`User=hermes` in the unit, not the uid that installed it. `--system` *does* have to
+be installed by root; the CLI refuses it otherwise and remaps `HERMES_HOME` to the
+target user itself.
+
+**4. Home channel.** Where cron results and cross-platform messages land. Hermes
+prompts for `/hermes sethome` in chat, which needs a `/hermes` slash command
+registered on the app — this manifest deliberately has none. Use `SLACK_HOME_CHANNEL`
+in the secret instead: it is read at every start and overrides the stored value, so a
+rebuilt box keeps its home channel instead of waiting for someone to remember the
+click. Create the channel, invite the bot (`/invite @Hermes`), take its ID from
+*View channel details* → bottom (`C…`), add it to the secret, then
+`ssh root@hermes systemctl restart hermes-gateway`.
+
+**The allowlist is a hard gate.** `SLACK_ALLOWED_USERS` unset means deny-all, so the
+bot would install, connect, and then ignore every message — a failure that looks like
+a Slack problem for an hour. Section 7 refuses to install without it.
+`GATEWAY_ALLOW_ALL_USERS` is never the fix, and is deliberately absent from the secret.
+
+### Rotation
+
+The unit gets a drop-in at
+`/etc/systemd/system/hermes-gateway.service.d/10-render-env.conf` adding a single
+`ExecStartPre=/usr/local/bin/hermes-render-env`, so every start re-reads the secret.
+Rotating any key — Slack, Kimi, anything — is:
+
+```sh
+aws secretsmanager put-secret-value --region ca-west-1 --secret-id hermes --secret-string file://hermes.json
+ssh root@hermes systemctl restart hermes-gateway
+```
+
+A drop-in rather than an edit of the unit: Hermes compares the installed unit against
+what it would generate and reports an edited one as drift.
+
+### Verifying
+
+```sh
+ssh root@hermes 'systemctl status hermes-gateway --no-pager'
+ssh root@hermes 'journalctl -u hermes-gateway -n 50 --no-pager'   # look for the Slack socket connecting
+```
+
+Then, from Slack:
+
+| Do this | Expect |
+|---|---|
+| DM the bot from your allowlisted account | a reply |
+| DM from any other account | nothing at all |
+| Plain message in a channel it is in | ignored |
+| `@Hermes` in that channel | threaded reply; the thread continues without re-mentioning |
+| Ask it to run `cat /etc/hostname && id -un` | a container ID and `root` — **not** `ip-172-31-…` and `hermes` |
+| `sudo reboot`, then a full EC2 stop/start | the gateway comes back on its own |
 
 ### Rebuilding this box
 
