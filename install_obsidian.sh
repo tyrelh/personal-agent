@@ -1,6 +1,10 @@
 #!/bin/bash
-# Obsidian vault on the box: the headless Sync client, a continuous sync unit, and
-# the bind mount that makes the vault visible to the agent's sandbox container.
+# Obsidian vault on the box: the headless Sync client, a continuous sync unit, and the
+# ownership that lets both the sync daemon and the agent write to the same directory.
+#
+# The agent's shell runs on the host (terminal.backend local), so the vault needs no
+# mount and no wiring to be visible to it — it is a directory on the filesystem the
+# agent already has. All this file has to get right is who owns it.
 #
 # Runs as root on the box, copied there and started by ./deploy.sh. Self-contained and
 # safe to re-run: the install is skipped once the pinned version is present (FORCE=1 to
@@ -18,7 +22,6 @@ set -euo pipefail
 OB_VERSION="${OB_VERSION:-0.0.14}"    # open beta; pin it. Unpin at your own risk.
 NODE_MAJOR="${NODE_MAJOR:-22}"        # obsidian-headless engines: node >=22
 VAULT_DIR="${VAULT_DIR:-/srv/obsidian}"
-CONTAINER_PATH="${CONTAINER_PATH:-/workspace/vault}"
 SYNC_MODE="${SYNC_MODE:-bidirectional}"   # or pull-only / mirror-remote (read-only)
 HERMES_USER="${HERMES_USER:-hermes}"
 HERMES_HOME="/home/$HERMES_USER"
@@ -86,9 +89,10 @@ OB=$(command -v ob) || { echo "obsidian-headless installed but 'ob' is not on PA
 
 # --- 3. login ----------------------------------------------------------------
 # The daemon runs as root and so does the login, which is deliberate: the stored
-# session then lives in root's home, out of reach of the hermes user and of anything
-# that escapes the sandbox. The agent reaches the vault through the bind mount in
-# section 6 and nothing else.
+# session then lives in root's home, out of reach of the hermes user the agent runs as.
+# That session is the whole Obsidian account — every vault on it — while the vault
+# directory is one vault's notes. The agent gets the notes, not the account, and that
+# split is the only reason anything here still runs as root.
 #
 # The probe is sync-list-remote, not `ob login`. `ob login` with no arguments is
 # documented as printing account info when a session exists, but it exits 0 with no
@@ -138,12 +142,36 @@ if [ -e "$HERMES_HOME/.config/obsidian-headless/auth_token" ]; then
 fi
 
 # --- 4. vault ----------------------------------------------------------------
-# Root-owned, and that is what makes the ownership work out: the sandbox container
-# runs as root, so files the agent creates in the mount land root-owned on the host,
-# and a sync daemon running as anyone else could upload them but never edit or
-# delete them again. One uid on both sides of the mount, no remapping.
+# Two writers at two uids: the sync daemon runs as root (section 3 — it holds the
+# Obsidian session) and the agent's shell runs as hermes on this host. Group ownership
+# is what lets both work on the same files. root ignores modes, so only the hermes side
+# needs spelling out: the group is hermes, the setgid bit keeps new subdirectories in
+# that group, and the umask in section 5 — on the unit and on the one-shot sync — is
+# what stops root's own writes landing 644 and read-only to the agent.
+#
+# Group write is also the read-only switch. Under pull-only or mirror-remote a local
+# edit is either ignored or reverted on the next sync, and silently discarding the
+# agent's work is worse than refusing the write outright — so the group loses w and the
+# agent gets EACCES instead of a note that quietly disappears.
+if [ "$SYNC_MODE" = "bidirectional" ]; then
+  dir_mode=2770
+  file_mode=660
+  sync_umask=0007
+else
+  dir_mode=2750
+  file_mode=640
+  sync_umask=0027
+fi
+
+echo "==> vault ownership: root:$HERMES_USER, $dir_mode ($SYNC_MODE)"
 mkdir -p "$VAULT_DIR"
-chmod 700 "$VAULT_DIR"
+# Applied on every run rather than only at creation: the mode encodes SYNC_MODE, so
+# flipping that has to rewrite what is already on disk, and a re-run inherits whatever
+# the previous mode's daemon had already pulled down.
+chown -R "root:$HERMES_USER" "$VAULT_DIR"
+chmod "$dir_mode" "$VAULT_DIR"
+find "$VAULT_DIR" -mindepth 1 -type d -exec chmod "$dir_mode" {} +
+find "$VAULT_DIR" -mindepth 1 -type f -exec chmod "$file_mode" {} +
 
 if "$OB" sync-status --path "$VAULT_DIR" --json >/dev/null 2>&1; then
   echo "==> vault already linked at $VAULT_DIR"
@@ -175,8 +203,14 @@ fi
 # One-shot `ob sync` first: it is the check that the login and the E2EE password are
 # both right, and it fails loudly here instead of into journalctl. It also means the
 # vault has content before the agent can look at it.
+#
+# The umask is the same one the unit gets below, and it has to be here too: this is
+# root's shell, so without it the first run — the one that pulls the whole vault — lands
+# every file 644 and read-only to the agent. Section 4's chmod pass already ran, and on a
+# first run it ran over an empty directory. A subshell so it does not leak to the units
+# and files written after this point.
 echo "==> initial sync (first run pulls the whole vault)"
-"$OB" sync --path "$VAULT_DIR"
+( umask "$sync_umask"; "$OB" sync --path "$VAULT_DIR" )
 
 echo "==> installing obsidian-sync.service"
 cat > /etc/systemd/system/obsidian-sync.service <<UNIT_EOF
@@ -190,6 +224,11 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=$VAULT_DIR
 ExecStart=$OB sync --continuous --path $VAULT_DIR
+# The daemon is root and the agent is hermes, sharing the vault by group (section 4).
+# Without this every file root pulls down lands 644 — readable to the agent, not
+# writable — and editing a synced note fails. Follows SYNC_MODE for the same reason the
+# modes do: under pull-only the agent must not be able to write what the daemon pulls.
+UMask=$sync_umask
 # Beta client on a box nobody watches: assume it will die and let systemd deal with
 # it. StartLimit off, because a crash loop that gives up silently is worse than one
 # that keeps retrying and shows up in the journal.
@@ -207,99 +246,40 @@ systemctl enable obsidian-sync
 systemctl restart obsidian-sync
 systemctl is-active --quiet obsidian-sync || { systemctl status --no-pager -l obsidian-sync; exit 1; }
 
-# --- 6. hand the vault to the agent -----------------------------------------
-# Phase 3 put the agent's shell in a container that mounts only its own sandbox dir,
-# so a vault sitting on the host filesystem is invisible to it. terminal.docker_volumes
-# is the bind mount. Read-only unless the mode is bidirectional — under pull-only or
-# mirror-remote a local write is either ignored or reverted, and silently discarding
-# the agent's work is worse than telling it the mount is read-only.
-mount_opts=""
-[ "$SYNC_MODE" = "bidirectional" ] || mount_opts=":ro"
-mount="$VAULT_DIR:$CONTAINER_PATH$mount_opts"
-
-# Merge into the existing list rather than replacing it: hermes may have other mounts
-# configured, and dropping them here would be a silent regression. Any stale entry for
-# this same host path is dropped first, so flipping SYNC_MODE rewrites the mount
-# instead of leaving two conflicting ones.
-# `hermes config get` prints a YAML block list — one "- entry" per line — not JSON, and
-# prints nothing at all for a key that is not set.
-raw=$(as_hermes bash -lc 'hermes config get terminal.docker_volumes' 2>/dev/null | tr -d '\r' || true)
-if [ -z "$(printf '%s' "$raw" | tr -d '[:space:]')" ]; then
-  existing='[]'
-else
-  existing=$(printf '%s\n' "$raw" \
-    | sed -n 's/^[[:space:]]*-[[:space:]]*//p' \
-    | sed -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/" \
-    | jq -Rcs 'split("\n") | map(select(length > 0))')
-  # Refuse rather than guess: output that parsed to nothing is a format this does not
-  # understand, and resetting the list would silently delete mounts added by hand.
-  [ "$(printf '%s' "$existing" | jq 'length')" -gt 0 ] || {
-    echo "could not parse terminal.docker_volumes — add the vault mount by hand:" >&2
-    printf '%s\n' "$raw" >&2
-    exit 1
-  }
-fi
-volumes=$(jq -cn --argjson cur "$existing" --arg p "$VAULT_DIR" --arg m "$mount" \
-  '($cur | map(select(startswith($p + ":") | not))) + [$m]')
-
-echo "==> mounting the vault into the sandbox: $mount"
-as_hermes bash -lc "hermes config set terminal.docker_volumes '$volumes'"
-
-# The gateway reads config into memory at start, so it needs a restart to know about the
-# new mount at all. That alone is NOT enough — see section 7. Skipped when there is no
-# gateway yet (Phase 4 not done). The restart drains in-flight turns first, which is what
-# makes it safe to remove containers immediately afterwards.
-if systemctl list-unit-files hermes-gateway.service >/dev/null 2>&1 &&
-   systemctl is-active --quiet hermes-gateway; then
-  echo "==> restarting the gateway so it reloads the mount config"
-  "$HERMES_HOME/.local/bin/hermes" gateway restart --system
-fi
-
-# --- 7. verify ---------------------------------------------------------------
+# --- 6. verify ---------------------------------------------------------------
 echo "==> verifying"
 "$OB" sync-status --path "$VAULT_DIR"
 
-# The sandbox container is long-lived (terminal.container_persistent is true) and keeps
-# whatever mount table it was created with. Setting terminal.docker_volumes does nothing
-# to a running box, and neither does restarting the gateway — only removing the container
-# does, and hermes builds a fresh one on the next tool call.
-image=$(as_hermes bash -lc "hermes config get terminal.docker_image")
-stale=$(as_hermes docker ps -aq --filter "name=^hermes-" --filter "ancestor=$image")
-if [ -n "$stale" ]; then
-  echo "==> removing the stale sandbox container so the mount table is rebuilt"
-  # shellcheck disable=SC2086 -- deliberately unquoted: this is a list of ids
-  as_hermes docker rm -f $stale >/dev/null
+# Checked at the agent's uid, not root's: root passes every one of these whatever the
+# mode says, which is precisely why checking as root proves nothing. `if` rather than
+# `&&`, so a failing test is a branch and not a set -e exit.
+if ! as_hermes test -r "$VAULT_DIR"; then
+  echo "$HERMES_USER cannot read $VAULT_DIR" >&2
+  exit 1
+fi
+if [ "$SYNC_MODE" = "bidirectional" ]; then
+  if ! as_hermes test -w "$VAULT_DIR"; then
+    echo "$HERMES_USER cannot write $VAULT_DIR — expected write under $SYNC_MODE" >&2
+    exit 1
+  fi
+elif as_hermes test -w "$VAULT_DIR"; then
+  echo "$VAULT_DIR is writable by $HERMES_USER — expected read-only under $SYNC_MODE" >&2
+  exit 1
 fi
 
-# One real agent tool call to force a container into existence, then assert on Docker's
-# own mount table.
-#
-# The check goes through the agent, not a throwaway `docker run -v "$mount"`. Mounting the
-# directory by hand only proves Docker can do it; it says nothing about whether hermes
-# applies terminal.docker_volumes to the container the agent actually gets. The earlier
-# version of this script did the throwaway version, passed, and left a box where the
-# vault was invisible to the agent.
-echo "==> forcing a fresh sandbox container"
-as_hermes bash -lc "hermes -z 'Use the terminal tool to run exactly: ls $CONTAINER_PATH | head -1. Reply with the raw output only.'" >/dev/null
+# One real agent tool call, because the shell the agent actually gets is the thing under
+# test. The container version of this script once checked the mount by hand, passed, and
+# left a box where the vault was invisible to the agent; the same trap applies to testing
+# this with sudo and calling it done.
+echo "==> checking the agent can see the vault"
+as_hermes bash -lc "hermes -z 'Use the terminal tool to run exactly: ls -d $VAULT_DIR. Reply with the raw output only.'" \
+  | grep -qx "$VAULT_DIR" \
+  || { echo "the agent's shell cannot see $VAULT_DIR" >&2; exit 1; }
 
-container=$(as_hermes docker ps -q --filter "name=^hermes-" --filter "ancestor=$image" | head -1)
-[ -n "$container" ] || { echo "no sandbox container exists after an agent tool call" >&2; exit 1; }
-
-# rw=true is what a bidirectional mount must report; :ro must come back false.
-expect_rw=false
-[ "$SYNC_MODE" != "bidirectional" ] || expect_rw=true
-tmpl='{{range .Mounts}}{{if eq .Destination "'"$CONTAINER_PATH"'"}}{{.RW}}{{end}}{{end}}'
-got_rw=$(as_hermes docker inspect -f "$tmpl" "$container")
-
-[ -n "$got_rw" ] || { echo "$CONTAINER_PATH is not mounted in the sandbox container" >&2; exit 1; }
-[ "$got_rw" = "$expect_rw" ] || {
-  echo "$CONTAINER_PATH is mounted rw=$got_rw in the sandbox, expected rw=$expect_rw" >&2
-  exit 1
-}
-
-# --- 8. tell the agent the vault exists -------------------------------------
-# Mounting it is not enough: nothing in the agent's context mentions a vault, so asked
-# "where are my notes" it has no reason to look. AGENTS.md is auto-injected into every
+# --- 7. tell the agent the vault exists -------------------------------------
+# Reachable is not the same as known: nothing in the agent's context mentions a vault,
+# so asked "where are my notes" it has no reason to look in /srv. AGENTS.md is
+# auto-injected into every
 # session (alongside SOUL.md and memory), which makes it the place to say so.
 #
 # It has to sit in the directory the hermes process actually runs from, and injection
@@ -316,8 +296,8 @@ if [ "$SYNC_MODE" = "bidirectional" ]; then
   writes="Files you create or edit there sync to every device on the account within
 seconds, so treat it as the user's live notes, not a scratch directory."
 else
-  writes="The mount is read-only ($SYNC_MODE): you can read the notes but not change
-them, and a write will fail rather than propagate."
+  writes="It is read-only to you ($SYNC_MODE): you can read the notes but not change
+them, and a write will fail with a permission error rather than propagate."
 fi
 
 tmp=$(mktemp)
@@ -331,13 +311,13 @@ cat >> "$tmp" <<AGENTS_EOF
 $block_begin
 ## Obsidian vault
 
-The user's Obsidian vault "$OBSIDIAN_VAULT" is mounted in your sandbox at
-\`$CONTAINER_PATH\`. It is a real Obsidian vault kept in sync by the headless Sync
-client, so it is the same notes the user reads on their phone and laptop.
+The user's Obsidian vault "$OBSIDIAN_VAULT" is on this machine at \`$VAULT_DIR\`. It is a
+real Obsidian vault kept in sync by the headless Sync client, so it is the same notes
+the user reads on their phone and laptop.
 
 $writes
 
-Read \`$CONTAINER_PATH/AGENTS.md\` if it exists — it holds the user's own conventions for
+Read \`$VAULT_DIR/AGENTS.md\` if it exists — it holds the user's own conventions for
 how the vault is organised.
 $block_end
 AGENTS_EOF
@@ -348,4 +328,4 @@ trap - EXIT
 chown "$HERMES_USER:$HERMES_USER" "$agents_md"
 chmod 644 "$agents_md"
 
-echo "==> vault ready at $VAULT_DIR ($CONTAINER_PATH in the sandbox, $SYNC_MODE)"
+echo "==> vault ready at $VAULT_DIR ($SYNC_MODE)"

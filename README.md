@@ -5,7 +5,7 @@ Phase 0 of the Hermes agent plan: state backend, EC2 host, IAM.
 Two steps, and the split is the whole design. `terraform apply` builds the box and
 `user_data.sh` gets it onto the tailnet with sshd masked — Phase 1, and nothing more.
 Then `./deploy.sh` copies the install scripts over Tailscale SSH and runs them: Phase 2
-(Hermes), Phase 3 (the Docker sandbox), Phase 4 (the Slack gateway) and the Obsidian
+(Hermes), Phase 3 (the agent's shell), Phase 4 (the Slack gateway) and the Obsidian
 vault. Both scripts are idempotent, so re-running `deploy.sh` is the normal way to change
 anything above the base OS.
 
@@ -256,20 +256,27 @@ unconfigured chat platforms, and two npm advisories in build-time tooling. `herm
 check` listing hundreds of `○` variables is not an error either — those are the optional
 integrations we do not use.
 
-## Phase 3 — sandbox the agent's shell
+## Phase 3 — the agent's shell runs on the host
 
-Section 2 of `install_hermes.sh` installs Docker; section 5 points Hermes at it. Same
-file as Phase 2, so it deploys the same way: `./deploy.sh hermes`.
+Section 2 of `install_hermes.sh` is the *absence* of a sandbox; section 4 points Hermes
+at the host. Same file as Phase 2, so it deploys the same way: `./deploy.sh hermes`.
 
-Five settings, and one of them is the whole phase:
+Six settings, and the first one is the whole phase:
 
 | Key | Value | Why |
 |---|---|---|
-| `terminal.backend` | `docker` | The agent's shell runs in a container, not on the host. |
-| `terminal.container_memory` | `2048` | Shipped default is 5120MB — more than this 4GB box has. |
-| `approvals.mode` | `smart` | Already the default; pinned so an upstream change shows as a diff. |
-| `approvals.cron_mode` | `deny` | Ditto. Decides what a headless cron job does with a dangerous command. |
+| `terminal.backend` | `local` | The agent's shell runs on this host, as `hermes`, with the whole filesystem in reach. |
+| `approvals.mode` | `off` | No approval prompt at all. There is nobody at a terminal to answer one. |
+| `approvals.cron_mode` | `approve` | A cron job has no approval channel, so `deny` does not mean "ask someone" — it means "block the command". |
+| `approvals.single_query_mode` | `approve` | Same for a `hermes -q`/`-z` session. |
+| `approvals.unattended_mode` | `approve` | Same for unattended platforms; the Slack gateway is one. |
 | `model.default` | `kimi/kimi-k3` | Phase 2. |
+
+The four `approvals` keys were decoration under the old container backend — Hermes skips
+the dangerous-command approval stack entirely when the shell is in a container, because
+the container is the boundary. On the host they are live, and every one of them fails
+closed by default, which on a box with nobody watching means a command that blocks until
+it times out.
 
 The rest of the plan's Phase 3 list needs no code: `.env` is already `chmod 600`
 (`hermes-render-env` writes it under `umask 077`), the dashboard's default bind is
@@ -277,49 +284,61 @@ The rest of the plan's Phase 3 list needs no code: `.env` is already `chmod 600`
 not in the secret, and the gateway does not exist until Phase 4 — when it must be
 installed as the `hermes` user, never root.
 
-### What the container backend actually buys
+### Why there is no container
 
-Hermes runs every container `--cap-drop ALL --security-opt no-new-privileges
---pids-limit 256`, mounting only `~/.hermes/sandboxes/docker/<task>/` as `/root` and
-`/workspace` plus a handful of `~/.hermes` cache and skill directories. No Docker
-socket, no `.env`, no `state.db`, no host filesystem.
+The VM is the boundary. This box runs one thing, its security group has zero ingress,
+sshd is masked in favour of Tailscale SSH, and everything on the filesystem is either
+the agent's own or was deliberately put there for it. A container inside that adds a
+second boundary whose main practical effect is that *ordinary* things — the Obsidian
+vault, a checkout, a file the user asks about — are invisible until somebody adds a bind
+mount for them. That is the cost that decided it: handing the agent one directory of
+notes previously took a `terminal.docker_volumes` entry, a gateway restart, and a
+container teardown, and it still silently did nothing until all three were right.
 
-That is also why the approval settings above are close to decoration here: under a
-container backend Hermes **skips the dangerous-command approval stack entirely**,
-deliberately — the container is the boundary, so there is no prompt to answer and
-nothing it runs reaches the host. They matter again if the backend is ever moved
-back to `local`.
+What is given up is real and worth naming. With `terminal.backend local` a wrong command
+reaches the host: `~/.hermes/.env` (every API key), `state.db`, the systemd units, the
+whole filesystem. `.env` is `chmod 600` and owned by `hermes`, so the agent can read its
+own keys — that is not a leak so much as an acknowledgement that this design has no
+answer to it. The Obsidian session is root's and stays out of reach (Phase 5). None of
+this holds against a hostile agent, only a careless one, and only weakly; rebuild is the
+recovery plan, which is why the root volume outlives `terraform destroy`.
 
-The `hermes` user is in the `docker` group, which is root-equivalent *on the host*.
-The agent never reaches it: its shell is inside the container, and no socket is
-mounted there. Rootless Docker would close the gap for a container escape too, at the
-cost of a userns AppArmor profile on noble — worth it if this ever has to hold against
-a hostile agent rather than a wrong one.
-
-### Two things that break silently without the daemon config
-
-1. **DNS.** Containers inherit the host `resolv.conf` unless it points at a loopback
-   resolver — which noble's `systemd-resolved` does. Docker then substitutes its own
-   public defaults (8.8.8.8), which the security group has no egress rule for, so every
-   lookup in every container hangs until it times out. `/etc/docker/daemon.json` pins
-   the daemon to the VPC resolver the host is actually using.
-2. **Log growth.** The default `json-file` driver never rotates, on a 30GB root volume.
-   Capped at 10MB × 3 per container.
-
-Verification, all of it run by the install script itself except the last:
+`approvals.deny` is the one guard rail left standing, and it is empty on purpose. It is a
+glob denylist checked *even under* `mode: off`, which makes it the right place for a
+specific command that must never run here — not a general safety net:
 
 ```sh
-docker inspect -f '{{.HostConfig.Memory}} {{.HostConfig.CapDrop}} {{.HostConfig.SecurityOpt}}' \
-  $(docker ps -q | head -1)     # 2147483648 [ALL] [no-new-privileges]
-
-hermes -z 'Use the terminal tool to run: cat /etc/hostname && id -un. Raw output only.'
-# a container ID and `root` — NOT ip-172-31-x-x and `hermes`
+hermes config set approvals.deny '["shutdown*", "git push --force*"]'
 ```
 
-The sandbox image (`nikolaik/python-nodejs:python3.11-nodejs20`, ~1GB) is pulled at
-install time so the first agent command does not stall on it, and a `getent hosts`
-inside a throwaway container is the install's own check on the DNS fix. Disk after the
-pull: 7.4GB of 29GB.
+### Converging a box that had the container backend
+
+`install_hermes.sh` tears the old setup down, because leaving it in place is not inert:
+
+- **`hermes` is removed from the `docker` group.** That group is root-equivalent on the
+  host. It was harmless when the agent's shell was inside a container with no socket
+  mounted; with the shell on the host, the agent would reach it.
+- **`docker.socket` and `docker.service` are disabled and stopped.**
+- **`terminal.container_*` and `terminal.docker_volumes` are unset.** Inert under the
+  local backend, but a leftover `docker_volumes` entry reads as configuration that is
+  still doing something.
+
+The package is left installed. Purge it when you want the ~2GB back:
+
+```sh
+ssh root@hermes 'apt-get purge -y docker.io && rm -rf /var/lib/docker'
+```
+
+### Verifying
+
+The install script runs this itself. It is the check that the backend actually took, and
+it is worth having because a wrong answer surfaces later as an empty vault rather than
+as an error:
+
+```sh
+hermes -z 'Use the terminal tool to run exactly: id -un. Reply with the raw output only.'
+# hermes    — under the old container backend this answered `root`
+```
 
 ## Phase 4 — Slack gateway
 
@@ -417,7 +436,7 @@ Then, from Slack:
 | DM from any other account | nothing at all |
 | Plain message in a channel it is in | ignored |
 | `@Hermes` in that channel | threaded reply; the thread continues without re-mentioning |
-| Ask it to run `cat /etc/hostname && id -un` | a container ID and `root` — **not** `ip-172-31-…` and `hermes` |
+| Ask it to run `cat /etc/hostname && id -un` | `ip-172-31-…` and `hermes` — the shell is the host itself (Phase 3) |
 | `sudo reboot`, then a full EC2 stop/start | the gateway comes back on its own |
 
 ### Rebuilding this box
@@ -589,9 +608,10 @@ ssh root@hermes tailscale serve status
 
 `install_obsidian.sh`. Puts a real Obsidian vault on the box, kept in sync by
 [obsidian-headless](https://github.com/obsidianmd/obsidian-headless) — the official CLI
-client for Obsidian Sync, no desktop app — and bind-mounts it into the agent's sandbox.
-Notes edited on a phone show up in the agent's filesystem, and (in the default mode) the
-agent's edits show up on the phone.
+client for Obsidian Sync, no desktop app. The agent's shell is the host (Phase 3), so
+the vault needs no mount and no wiring to be visible to it — all this has to get right
+is who owns the directory. Notes edited on a phone show up in the agent's filesystem,
+and (in the default mode) the agent's edits show up on the phone.
 
 `./deploy.sh` runs it after `install_hermes.sh`, and it is a no-op when the `OBSIDIAN_*`
 keys are absent from the secret, exactly like the Phase 4 gateway. On its own:
@@ -602,8 +622,7 @@ ssh root@hermes /usr/local/sbin/hermes-obsidian-install   # or re-run it in plac
 ```
 
 Knobs, all optional: `SYNC_MODE=` (below), `VAULT_DIR=` (default `/srv/obsidian`),
-`CONTAINER_PATH=` (default `/workspace/vault`), `OB_VERSION=` and `NODE_MAJOR=`,
-`FORCE=1` to reinstall the client over the top.
+`OB_VERSION=` and `NODE_MAJOR=`, `FORCE=1` to reinstall the client over the top.
 
 ### Setting it up
 
@@ -651,30 +670,39 @@ drops them alongside `TAILSCALE_AUTH_KEY`, and `install_obsidian.sh` reads them 
 Secrets Manager directly instead. The reasoning is in the comment on that filter.
 
 **The sync daemon runs as root, and so does the login.** Deliberate, and the one place
-this repo departs from "services run as `hermes`":
+this repo departs from "services run as `hermes`". The stored Obsidian session lands in
+root's home, where the `hermes` user the agent runs as cannot read it. That session is
+the whole *account* — every vault on it, and the ability to change the password; the
+vault directory is one vault's notes. The agent gets the notes and not the account, and
+that split is the only reason anything here still runs as root.
 
-- The stored Obsidian session lands in root's home, where the `hermes` user — and
-  anything that escapes the sandbox — cannot read it. The agent reaches the vault
-  through the bind mount and nothing else.
-- The sandbox container runs as root, so files the agent creates in the vault are
-  root-owned on the host. A daemon running as anyone else could upload them but never
-  edit or delete them again — one uid on both sides of the mount avoids the whole
-  problem, and avoids having to turn on `terminal.docker_run_as_host_user` and change
-  what Phase 3 verified.
+### Who owns the vault
+
+Two writers at two uids: the sync daemon (root) and the agent's shell (`hermes`). They
+share the directory by group, which `install_obsidian.sh` sets on every run:
+
+- Owner `root`, group `hermes`, `2770` on every directory and `660` on every file.
+- The setgid bit keeps directories created inside in the `hermes` group.
+- `UMask=0007` on `obsidian-sync.service`, and the same umask around the install's own
+  one-shot `ob sync`. Without it every file the daemon pulls down lands `644` — readable
+  to the agent, not writable — and editing a synced note fails. Both are needed: the
+  chmod pass runs before the first sync, when the directory is still empty.
+
+root ignores modes, so only the `hermes` side of this needs spelling out.
 
 ### Sync mode
 
-| `SYNC_MODE` | Mount | Effect |
-|---|---|---|
-| `bidirectional` (default) | read-write | The agent's edits propagate to every device on the account. |
-| `pull-only` | `:ro` | Vault is read-only to the agent; local changes ignored. |
-| `mirror-remote` | `:ro` | Same, and any local change is reverted. |
+| `SYNC_MODE` | Vault modes | umask | Effect |
+|---|---|---|---|
+| `bidirectional` (default) | `2770` / `660` | `0007` | The agent's edits propagate to every device on the account. |
+| `pull-only` | `2750` / `640` | `0027` | Vault is read-only to the agent; local changes ignored. |
+| `mirror-remote` | `2750` / `640` | `0027` | Same, and any local change is reverted. |
 
-Set on every run, not just at setup, so it converges rather than drifting. Under
-`pull-only`/`mirror-remote` the bind mount is made `:ro` too — a mount the agent can
-write to but whose writes are silently discarded is worse than one it is told is
-read-only. Flipping the mode later rewrites the existing mount rather than adding a
-second one:
+Set on every run, not just at setup, so it converges rather than drifting — flipping the
+mode rewrites the modes already on disk. Group write is the read-only switch: under
+`pull-only`/`mirror-remote` a local edit is either ignored or reverted on the next sync,
+and a vault the agent can write to but whose writes vanish is worse than one that
+refuses the write with `EACCES`.
 
 ```sh
 SYNC_MODE=pull-only ./deploy.sh obsidian
@@ -682,10 +710,11 @@ SYNC_MODE=pull-only ./deploy.sh obsidian
 
 ### Telling the agent it has a vault
 
-Mounting the vault is not enough. Nothing in the agent's context mentions it, so asked
-"where are my notes" it has no reason to go looking — which is exactly what happened the
-first time. `install_obsidian.sh` writes a block into `~/.hermes/AGENTS.md`, which Hermes
-auto-injects into every session alongside `SOUL.md` and memory.
+Reachable is not the same as known. Nothing in the agent's context mentions the vault, so
+asked "where are my notes" it has no reason to go looking in `/srv` — which is exactly
+what happened the first time. `install_obsidian.sh` writes a block into
+`~/.hermes/AGENTS.md`, which Hermes auto-injects into every session alongside `SOUL.md`
+and memory.
 
 It has to be `~/.hermes/AGENTS.md`, not `~/AGENTS.md`: injection reads the directory the
 process runs from and **does not walk up the tree**, and the gateway's
@@ -695,26 +724,17 @@ tool call.
 
 The block is delimited and rewritten on every run, so anything else in that file
 survives. Its wording follows `SYNC_MODE`, so under `pull-only` the agent is told the
-mount is read-only rather than being left to discover it by failing a write.
-
-### How the agent actually sees it
-
-Phase 3 put the agent's shell in a container that mounts only its own sandbox directory,
-so a vault sitting on the host filesystem is invisible to it. `terminal.docker_volumes`
-is the bind mount, and the script merges its entry into whatever is already there rather
-than replacing the list — if that key is ever something other than a JSON array of
-strings it refuses and asks you to merge by hand, because resetting it would silently
-delete somebody's hand-added mount.
-
-The sandbox container is long-lived and keeps its old mount table until it is recreated,
-so the script restarts the gateway (when there is one) to force that.
+vault is read-only rather than being left to discover it by failing a write.
 
 ### Verifying
 
-The script checks all of this itself except the last row — a one-shot `ob sync` before
+The script checks all of this itself except the last row: a one-shot `ob sync` before
 installing the unit (which is what proves the login and the E2EE password), then
-`sync-status`, then a throwaway container that touches a file in the mount to prove the
-agent-side path and its writability.
+`sync-status`, then `test -r`/`test -w` **as the `hermes` user** — root passes those
+whatever the mode says, which is why checking as root proves nothing — and finally one
+real agent tool call. That last one matters: the container version of this script once
+checked the mount by hand, passed, and left a box where the vault was invisible to the
+agent. The shell the agent actually gets is the thing under test.
 
 ```sh
 ssh root@hermes 'systemctl status obsidian-sync --no-pager'
@@ -742,9 +762,10 @@ ssh root@hermes 'ob sync-status --path /srv/obsidian'
   part stayed in `user_data.sh` — `install_hermes.sh` refuses to run without it. Hermes
   installs under that user (see Phase 2 above). `unattended-upgrades` needs no setup — the
   Ubuntu cloud image ships it enabled.
-- **`terminal.backend` is `docker` (Phase 3).** Nothing is listening and no gateway is
-  installed yet, so the agent still only runs when someone starts it by hand — but its
-  shell is already in a container, which is the thing Phase 4 must not be done without.
+- **`terminal.backend` is `local` (Phase 3).** The agent's shell is this host, as the
+  `hermes` user, with no container between it and the filesystem. The VM is the boundary;
+  read the trade-off in Phase 3 before adding anything to this box that is not the
+  agent's.
 - The root volume has `delete_on_termination = false`. `terraform destroy` leaves the
   volume behind on purpose — it holds `~/.hermes`. Delete it manually when you mean to.
 - Egress includes TCP 80 and UDP 53 beyond the plan's 443/41641: Ubuntu's arm64 apt
@@ -753,3 +774,4 @@ ssh root@hermes 'ob sync-status --path /srv/obsidian'
 - The AMI comes from Canonical's SSM public parameter, but the instance ignores AMI
   changes so a new Canonical image never silently replaces the running agent. To move
   to a newer image: `terraform taint aws_instance.hermes` then apply, on purpose.
+wher
