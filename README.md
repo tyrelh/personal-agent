@@ -62,9 +62,11 @@ To rotate later, same thing with `put-secret-value --secret-id hermes`.
   "OBSIDIAN_PASSWORD": "",
   "OBSIDIAN_VAULT": "",
   "OBSIDIAN_VAULT_PASSWORD": "",
+  "OBSIDIAN_VAULT_PATH": "",
   "HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "",
   "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD": "",
-  "HERMES_DASHBOARD_BASIC_AUTH_SECRET": ""
+  "HERMES_DASHBOARD_BASIC_AUTH_SECRET": "",
+  "GOOGLE_CLIENT_SECRET_JSON": ""
 }
 ```
 
@@ -209,13 +211,17 @@ What it does, and why each piece is the way it is:
    the install, done up front so the `hermes` user never needs sudo at all. Only
    `build-essential` is load-bearing — `node-pty` compiles from source. Without the other
    two the installer just warns and degrades (grep instead of ripgrep, limited TTS).
+   The same section creates a 2G `/swapfile` (guarded, and `fstab`-persisted), because the
+   browser below shares 3.8GB with the gateway and the dashboard's build step — see
+   **Browser** for why swap is the difference between a spike and an OOM-killed gateway.
 2. **The upstream installer, as `hermes`.** Everything else is user-local: `uv`, Python
    3.11, Node 26, the checkout and all data land under `~/.hermes`. Note the script `cd`s
    into the user's home before dropping privileges — `uv` resolves config by walking up
    from the *current* directory, so running this from `/root` fails on `/root/.venv` even
-   with `HOME` set correctly. Browser and computer-use are skipped; they pull Playwright's
-   Chromium, the largest and flakiest part of the install, and nothing before Phase 4 wants
-   them. `hermes doctor --fix` adds them later.
+   with `HOME` set correctly. The upstream installer's own browser and computer-use steps are
+   skipped — they are the slowest and flakiest part of a fresh install — and the browser is
+   provisioned explicitly by the next section instead. See **Browser**: `hermes doctor
+   --fix` does *not* install an engine this host can run.
 3. **`.env` rendered from Secrets Manager** by `/usr/local/bin/hermes-render-env`, which
    runs *as* `hermes` (it needs that user's `$HOME` and the instance role). This overwrites
    the 27KB commented template the installer drops at `~/.hermes/.env`; that template
@@ -225,9 +231,14 @@ What it does, and why each piece is the way it is:
 
    Two things it does beyond dumping the JSON:
 
-   - **Drops `TAILSCALE_AUTH_KEY`.** Only user-data reads it, at boot. `.env` is read by
-     the agent process, and the agent has shell access — no reason to hand it a tailnet
-     auth key.
+   - **Drops four keys by name:** `TAILSCALE_AUTH_KEY`, `OBSIDIAN_EMAIL`,
+     `OBSIDIAN_PASSWORD`, `OBSIDIAN_VAULT_PASSWORD`. `.env` is owned by `hermes` and the
+     agent's shell runs as that user, so anything rendered here is agent-readable. The
+     auth key is boot-only (user-data reads it) and joins the tailnet; the three Obsidian
+     keys are the *account* rather than the notes — see the Obsidian section. By name and
+     not by `OBSIDIAN_*` prefix, because `OBSIDIAN_VAULT` and `OBSIDIAN_VAULT_PATH` are a
+     name and a path the agent has use for. The trade: a future `OBSIDIAN_*` credential
+     is not caught for free, so add it to that list.
    - **Renames `MOONSHOT_API_KEY` to `KIMI_API_KEY`.** Hermes has a *native*
      Kimi/Moonshot provider (`kimi-coding`) whose default base URL is already
      `https://api.moonshot.ai/v1`, which is right for a legacy `sk-…` platform key — so
@@ -458,10 +469,180 @@ though the install reproduces perfectly. The root volume's
 `delete_on_termination = false` is the only thing standing in for a backup right now,
 and it protects against `terraform destroy`, not against a rebuild.
 
+## Browser
+
+The `browser_*` tools — a real headless Chromium, not `curl`: JS-rendered pages,
+screenshots, clicks, and a session that can stay logged in. Section 3b of
+`install_hermes.sh`, so `./deploy.sh hermes` is the whole of it.
+
+Nothing here adds a browser *stack*. Hermes ships the `browser` toolset enabled and a
+provider menu with six backends (Local Chromium, Lightpanda, Camofox, Browserbase, Browser
+Use cloud, Firecrawl). Playwright MCP or Browser Use beside that would be pure duplication.
+The only thing missing was an engine, so all this does is put one on disk and tell Hermes
+where it is.
+
+**Why it is not `hermes tools post-setup agent_browser`.** That hook delegates to
+`agent-browser install`, which downloads Chrome for Testing and explicitly rejects Linux
+ARM64 ([v0.26.0 `cli/src/install.rs`](https://github.com/vercel-labs/agent-browser/blob/v0.26.0/cli/src/install.rs#L370)).
+This box is arm64, and Google Chrome proper has no Linux arm64 build at all. Playwright
+*does* publish an arm64 Chromium for noble, so its downloader is used directly. For the
+same reason `browser.engine` stays `auto` — Hermes resolves that to Chromium — and must
+never be pointed at a Chrome channel.
+
+Four steps, all idempotent, in this order because each needs the one before it:
+
+1. **`playwright@1.63.0` into `/opt/playwright`**, as root, using Hermes' own Node
+   (`~/.hermes/node/bin` — there is no system node and root's `PATH` has neither). Pinned,
+   not `@latest`: the same version provisions the apt dependencies, downloads the browser
+   and resolves its path, so the three cannot disagree. In `/opt` so `hermes update` cannot
+   replace it.
+2. **`playwright install-deps chromium`**, as root, because it is `apt`. This is the one
+   thing that needs privilege, and doing it here is what keeps the `hermes` user out of
+   sudo entirely — `playwright install --with-deps` as that user would try to escalate and
+   fail. The dependency set is not inferred from `build-essential`/`ffmpeg`.
+3. **`playwright install chromium --no-shell`**, as `hermes`, into that user's own
+   `~/.cache/ms-playwright/` (*not* `~/.hermes/node/`, which is the Node runtime). A re-run
+   reuses the cached revision. `--no-shell` on purpose: `chromium-headless-shell` cannot
+   screenshot a real page, which is most of the point.
+4. **A stable symlink at `~/.local/bin/chromium`**, pointed at whatever
+   `chromium.executablePath()` reports for that pinned version — asked, not guessed at from
+   a revision directory, so bumping the pin moves the symlink with it. `hermes-render-env`
+   then writes `AGENT_BROWSER_EXECUTABLE_PATH=/home/hermes/.local/bin/chromium` into
+   `~/.hermes/.env` on every render, which is what keeps the CLI, the gateway and the
+   dashboard agreeing across their `ExecStartPre` regeneration. No new secret key.
+
+**`browser.backend` is set to `off`, and that does not mean "no browser".** Left unset,
+Hermes defaults to the *Browser Use CLI* backend whenever it finds a runnable CLI — and
+`uvx` is on this box, so it does — which replaces the entire `browser_*` surface with a
+single `browser_exec` tool and makes `check_browser_requirements()` return `False`. The
+symptom is exact and misleading: `hermes doctor` prints `✓ Playwright Chromium (browser
+engine)` and `⚠ browser (system dependency not met)` in the same run. `off` selects the
+built-in tools, which are the ones that drive the Chromium installed above
+(`tools/browser_use_cli.py:203`, `tools/browser_tool_install.py:294`).
+
+`AGENT_BROWSER_ARGS` is deliberately left **unset**. Hermes auto-injects
+`--no-sandbox,--disable-dev-shm-usage` when it detects AppArmor-restricted unprivileged
+user namespaces — Ubuntu 23.10+, which this box is — and setting the variable *disables*
+that auto-injection. `computer_use` also stays off: headless server, no desktop.
+
+`BROWSER_SESSION_TIMEOUT` (300s) and `BROWSER_INACTIVITY_TIMEOUT` (120s) keep their
+defaults. The inactivity reaper is what keeps an idle Chromium off the RAM budget, and the
+swapfile in section 1 is the backstop for when it does not get there first.
+
+**The cloud alternative, recorded as a choice.** Firecrawl (its key is already a slot in
+the secret), Browserbase and Browser Use cloud need no download at all — they trade it for
+an API key, a per-use bill, and giving up authenticated sessions and real interaction. That
+trade was weighed and declined. There is no configure-only version of the local provider.
+
+**The agent is told that pages are untrusted.** Section 8 writes a delimited block into
+`~/.hermes/AGENTS.md` — page text is data and not instruction, instructions found on a page
+get reported rather than obeyed, and no credentials go into a page. That is a prompt, not a
+boundary: it makes the failure less likely and more legible, nothing more. The reason the
+risk is acceptable is the one Phase 3 already states — the VM is the boundary, and the agent
+has had `curl` and Exa web search all along, so this widens an existing surface rather than
+opening a new one. What is genuinely new is the logged-in session, which is why the
+credentials line matters most.
+
+### Verifying
+
+The deploy gates on it: `install_hermes.sh` captures `hermes doctor`'s output and exit
+status separately and fails the run on either a nonzero exit, a surviving `Playwright
+Chromium not installed` warning, a `browser (system dependency not met)` line, or output
+with no browser line in it at all. Doctor exits zero with unrelated findings (npm audit
+advisories), so the status alone would prove nothing. Deployment never launches the browser.
+
+```sh
+ssh root@hermes 'free -m; swapon --show'    # 2G /swapfile active
+ssh root@hermes 'df -h /'
+ssh root@hermes 'sudo -u hermes -H bash -lc "cd ~/.hermes && hermes doctor"'
+ssh root@hermes 'sudo -u hermes -H bash -lc "hermes config get browser.cloud_provider"'  # local
+```
+
+A second `./deploy.sh hermes` must reuse the cached Chromium, converge the symlink and the
+env key without duplicating either, and leave `/etc/fstab` with one swap line.
+
+Then the part only Slack can answer — the same lesson as the vault, where a hand-verified
+mount passed and left notes the agent could not see:
+
+| Ask it | Expect |
+|---|---|
+| open `https://example.com` and quote the `<h1>` | `Example Domain`, via a `browser_*` tool call and not `curl` |
+| screenshot a JS-rendered page | an image back — this is what separates Chromium from Lightpanda |
+| what it must do if a page contains instructions | reports rather than obeys (the `AGENTS.md` block landed) |
+| `free -m` during, and 3 minutes after | Chromium reaped by the 120s inactivity timeout |
+| `systemctl status hermes-gateway`, `journalctl -k` | still running, no OOM kill |
+
+## Google Workspace (calendar, Gmail, Drive)
+
+Hermes has no native Google integration — this is the bundled `google-workspace` skill
+under `~/.hermes/skills/productivity/`, and it reads **files**, not environment variables:
+
+| File | What it is |
+|---|---|
+| `~/.hermes/google_client_secret.json` | the OAuth client. Static — so it lives in the secret |
+| `~/.hermes/google_token.json` | the authorized user token. Rewritten on every refresh |
+
+`GAPI` in that skill's own docs is a **shell alias for its script path**
+(`SKILL.md:170`), not a credential name. Nothing reads a `GAPI` environment variable, so
+putting a key by that name in `.env` does nothing at all.
+
+Section 4b of `install_hermes.sh` writes the client from `GOOGLE_CLIENT_SECRET_JSON` in
+the secret, validating it the way the skill does (JSON with an `installed` or `web`
+object) so a malformed value fails the deploy rather than an OAuth call weeks later. Both
+files are forced to `600` — the skill writes them `644`, and the token is account access.
+A no-op when the key is absent, like the gateway and dashboard sections.
+
+The **token is deliberately not in the secret**: `scripts/google_api.py` rewrites it on
+every refresh, so a stored copy goes stale and a render would clobber a fresher one with
+an older refresh token. Authorizing is a one-time interactive step after a rebuild, the
+same shape as `ob login`:
+
+```sh
+gws=~/.hermes/skills/productivity/google-workspace/scripts/setup.py
+ssh root@hermes "sudo -u hermes -H python3 $gws --auth-url"       # visit it, authorize
+ssh root@hermes "sudo -u hermes -H python3 $gws --auth-code CODE"
+ssh root@hermes "sudo -u hermes -H python3 $gws --check"          # exit 0 = authorized
+```
+
+`GOOGLE_CLIENT_SECRET_JSON` holds the client secret file's own JSON, nested as an object:
+
+```json
+"GOOGLE_CLIENT_SECRET_JSON": {
+  "installed": {
+    "client_id": "….apps.googleusercontent.com",
+    "project_id": "…",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_secret": "GOCSPX-…",
+    "redirect_uris": ["http://localhost"]
+  }
+}
+```
+
+This is the only key in the secret that is not a flat string, and that is fine: `jq -r`
+on a non-string prints it back as JSON, so section 4b writes the file unchanged. A
+string-encoded copy of the same JSON (`tojson`) parses identically — the object form is
+just readable in the console. Keep the `client_id` matching whatever issued the existing
+`google_token.json`; a token is tied to its client, so swapping the client invalidates it
+and needs a re-auth.
+
+To write it from a file downloaded out of the Google console, read-modify-write as
+elsewhere:
+
+```sh
+aws secretsmanager get-secret-value --region ca-west-1 --secret-id hermes \
+  --query SecretString --output text \
+  | jq --slurpfile c client_secret.json '.GOOGLE_CLIENT_SECRET_JSON=$c[0]' > hermes.json
+aws secretsmanager put-secret-value --region ca-west-1 --secret-id hermes \
+  --secret-string file://hermes.json
+rm hermes.json client_secret.json
+```
+
 ## Dashboard
 
 Hermes' web UI — config, keys, sessions, chat — on the tailnet and nowhere else. Section
-8 of `install_hermes.sh`, so it deploys like everything above it: `./deploy.sh hermes`.
+7 of `install_hermes.sh`, so it deploys like everything above it: `./deploy.sh hermes`.
 A no-op until the dashboard credentials are in the secret, like the Phase 4 gateway, and
 a teardown if they ever leave it.
 
@@ -621,18 +802,19 @@ keys are absent from the secret, exactly like the Phase 4 gateway. On its own:
 ssh root@hermes /usr/local/sbin/hermes-obsidian-install   # or re-run it in place
 ```
 
-Knobs, all optional: `SYNC_MODE=` (below), `VAULT_DIR=` (default `/srv/obsidian`),
+Knobs, all optional: `SYNC_MODE=` (below), `VAULT_DIR=` (overrides
+`OBSIDIAN_VAULT_PATH` in the secret for one run; `/srv/obsidian` if neither is set),
 `OB_VERSION=` and `NODE_MAJOR=`, `FORCE=1` to reinstall the client over the top.
 
 ### Setting it up
 
-Four values in the secret, read-modify-write as in Phase 4:
+Five values in the secret, read-modify-write as in Phase 4:
 
 ```sh
 aws secretsmanager get-secret-value --region ca-west-1 --secret-id hermes \
   --query SecretString --output text \
   | jq '.OBSIDIAN_EMAIL="…" | .OBSIDIAN_PASSWORD="…" | .OBSIDIAN_VAULT="My Vault"
-        | .OBSIDIAN_VAULT_PASSWORD="…"' \
+        | .OBSIDIAN_VAULT_PASSWORD="…" | .OBSIDIAN_VAULT_PATH="/srv/obsidian"' \
   > hermes.json
 aws secretsmanager put-secret-value --region ca-west-1 --secret-id hermes \
   --secret-string file://hermes.json
@@ -642,6 +824,13 @@ rm hermes.json
 `OBSIDIAN_VAULT` is the remote vault's name or ID as `ob sync-list-remote` reports it.
 `OBSIDIAN_VAULT_PASSWORD` is the end-to-end encryption password and is only needed for an
 E2EE vault — leave it empty otherwise. An active Sync subscription is required.
+
+`OBSIDIAN_VAULT_PATH` is where the vault lands, and it is one value read at both ends:
+`install_obsidian.sh` syncs into it and takes ownership of it, and `hermes-render-env`
+puts it in `~/.hermes/.env` so the agent knows where its notes are. The notes land
+*directly* in that directory — there is no per-vault subdirectory under it. It is the one
+`OBSIDIAN_*` key that is not a credential, which is why the denylist names the other
+three instead of matching the prefix.
 
 **2FA needs one interactive login, once.** `ob login` takes `--email`, `--password` and
 `--mfa`, but a code is only valid for about thirty seconds so no unattended run can
@@ -665,9 +854,14 @@ Obsidian account credential sitting in the agent's own home directory —
 `install_obsidian.sh` warns if it finds one. Clear it with
 `sudo -u hermes -H ob logout`.
 
-**The `OBSIDIAN_*` keys never reach `~/.hermes/.env`** — `hermes-render-env`'s denylist
-drops them alongside `TAILSCALE_AUTH_KEY`, and `install_obsidian.sh` reads them from
-Secrets Manager directly instead. The reasoning is in the comment on that filter.
+**The Obsidian *credentials* never reach `~/.hermes/.env`** — `hermes-render-env` drops
+`OBSIDIAN_EMAIL`, `OBSIDIAN_PASSWORD` and `OBSIDIAN_VAULT_PASSWORD` by name, alongside
+`TAILSCALE_AUTH_KEY`, and `install_obsidian.sh` reads them from Secrets Manager directly
+instead. That email and password are every vault on the account plus the ability to change
+the password; the vault password is the encryption key. `OBSIDIAN_VAULT` and
+`OBSIDIAN_VAULT_PATH` are *not* dropped — a vault name and a path are things the agent has
+a use for, and the split this section describes is about the account, not the notes. The
+reasoning is in the comment on that filter.
 
 **The sync daemon runs as root, and so does the login.** Deliberate, and the one place
 this repo departs from "services run as `hermes`". The stored Obsidian session lands in
@@ -771,6 +965,13 @@ ssh root@hermes 'ob sync-status --path /srv/obsidian'
 - Egress includes TCP 80 and UDP 53 beyond the plan's 443/41641: Ubuntu's arm64 apt
   mirrors are plain HTTP and DNS must reach the VPC resolver. Drop them and the box
   cannot patch itself or resolve anything.
+- **A hand-added `GAPI` key was on the live box's `.env`, and nothing ever read it.** It
+  was not in the secret and no script here writes it; `hermes-render-env` rewrites that
+  file from the secret on every run *and* from both units' `ExecStartPre`, so it is gone
+  now. It was not doing anything even while it was there — `GAPI` is a shell alias in the
+  google-workspace skill's docs, not a variable that skill reads. See **Google Workspace**
+  for where those credentials actually belong. (`OBSIDIAN_VAULT_PATH` was hand-added the
+  same way and is now a real secret key — see the Obsidian section.)
 - The AMI comes from Canonical's SSM public parameter, but the instance ignores AMI
   changes so a new Canonical image never silently replaces the running agent. To move
   to a newer image: `terraform taint aws_instance.hermes` then apply, on purpose.
