@@ -178,12 +178,25 @@ ENV_FILE="$HOME/.hermes/.env"
 tmp=$(mktemp "$ENV_FILE.XXXXXX")
 trap 'rm -f "$tmp"' EXIT
 
-# The first with_entries is the denylist: boot-only secrets that are not Hermes
-# variables and must not reach a file read by an agent with shell access.
-# TAILSCALE_AUTH_KEY is consumed by user-data at boot; the OBSIDIAN_* keys are read
-# from the secret directly by install_obsidian.sh, as root, and are the stronger case —
-# that email and password are access to every vault on the account. Add the next
-# boot-only key or prefix to this one clause.
+# The first with_entries is the denylist, and it names credentials rather than matching a
+# prefix: .env is owned by hermes and the agent's shell runs as that user, so anything
+# here is readable by the agent.
+#
+# TAILSCALE_AUTH_KEY is consumed by user-data at boot and joins the tailnet.
+# The three Obsidian keys are the account, not the notes: that email and password are
+# every vault on it plus the ability to change the password, and the vault password is
+# the encryption key. install_obsidian.sh reads all three from the secret directly, as
+# root, and the sync session stays in root's home — the agent gets one vault's notes and
+# not the account. Rendering them here would hand back exactly what that split withholds.
+#
+# GOOGLE_CLIENT_SECRET_JSON is a file, not a variable: the google-workspace skill reads
+# ~/.hermes/google_client_secret.json and no env var, so section 4b writes it there. In
+# .env it would be a credential nothing reads.
+#
+# Deliberately NOT a startswith("OBSIDIAN_") match: OBSIDIAN_VAULT and
+# OBSIDIAN_VAULT_PATH are a name and a path, the agent has use for both, and a prefix
+# guard silently swallowed the path key. The cost is that a future OBSIDIAN_* credential
+# is not caught for free — add the next one to this list by name.
 #
 # MOONSHOT_API_KEY is the name the key is stored under; Hermes' native Kimi/Moonshot
 # provider reads KIMI_API_KEY. Rename the key in the secret and that clause can go.
@@ -192,7 +205,12 @@ trap 'rm -f "$tmp"' EXIT
   --region "$REGION" \
   --query SecretString --output text \
   | jq -r '
-      with_entries(select(.key | . != "TAILSCALE_AUTH_KEY" and (startswith("OBSIDIAN_") | not)))
+      with_entries(select(.key
+        | . != "TAILSCALE_AUTH_KEY"
+        and . != "OBSIDIAN_EMAIL"
+        and . != "OBSIDIAN_PASSWORD"
+        and . != "OBSIDIAN_VAULT_PASSWORD"
+        and . != "GOOGLE_CLIENT_SECRET_JSON"))
       | with_entries(if .key == "MOONSHOT_API_KEY" then .key = "KIMI_API_KEY" else . end)
       | to_entries[]
       | select(.value != "")
@@ -219,6 +237,63 @@ chmod 755 /usr/local/bin/hermes-render-env
 # template survives as ~/.hermes/hermes-agent/.env.example.
 echo "==> rendering .env from Secrets Manager"
 as_hermes /usr/local/bin/hermes-render-env
+
+# --- 4b. google oauth client -------------------------------------------------
+# Calendar/Gmail/Drive access is the bundled `google-workspace` skill, and it reads two
+# files under ~/.hermes rather than any environment variable:
+#
+#   google_client_secret.json  the OAuth client — static, so it belongs in the secret
+#   google_token.json          the authorized user token, rewritten on every refresh
+#                              (the skill's scripts/google_api.py), so a copy in Secrets
+#                              Manager would go stale and a render would clobber a
+#                              fresher one
+#
+# So only the client lands here. Authorizing is a one-time interactive step after a
+# rebuild — the same shape as `ob login` for Obsidian:
+#
+#   gws=~/.hermes/skills/productivity/google-workspace/scripts/setup.py
+#   sudo -u hermes -H python3 $gws --auth-url    # visit it, authorize, copy the code
+#   sudo -u hermes -H python3 $gws --auth-code <code>
+#
+# A no-op when the key is absent, like the gateway and dashboard sections.
+# The secret value is the client secret file's own JSON — stored as a nested object,
+# which is what `jq -r` on a non-string prints back as JSON text. A string-encoded copy
+# of the same JSON works identically; the object form is just readable in the console.
+google_secret_file="$HERMES_HOME/.hermes/google_client_secret.json"
+google_client=$(/snap/bin/aws secretsmanager get-secret-value \
+  --secret-id "$SECRET_ID" --region "$REGION" \
+  --query SecretString --output text \
+  | jq -r '.GOOGLE_CLIENT_SECRET_JSON // ""')
+
+if [ -z "$google_client" ]; then
+  echo "==> no GOOGLE_CLIENT_SECRET_JSON in the secret — skipping the google oauth client"
+else
+  # The same validation the skill's own --client-secret does
+  # (scripts/setup.py:store_client_secret): a client secret file is JSON with an
+  # "installed" or "web" object. Checking here means a malformed value fails the deploy
+  # rather than surfacing as a cryptic OAuth error weeks later.
+  printf '%s' "$google_client" | jq -e 'has("installed") or has("web")' >/dev/null 2>&1 || {
+    echo "GOOGLE_CLIENT_SECRET_JSON is not a Google OAuth client secret (no 'installed'/'web' key)" >&2
+    exit 1
+  }
+  echo "==> writing the google oauth client to ~/.hermes/google_client_secret.json"
+  # umask so the temp file is never briefly world-readable, and a temp file at all so a
+  # failure cannot leave a truncated credential behind.
+  ( umask 077; printf '%s\n' "$google_client" > "$google_secret_file.new" )
+  chown "$HERMES_USER:$HERMES_USER" "$google_secret_file.new"
+  mv "$google_secret_file.new" "$google_secret_file"
+fi
+unset google_client
+
+# The token is not rendered, but its mode is still ours to fix: the skill writes both
+# files 644, and google_token.json is the refresh token — account access, on a box with
+# other uids on it.
+for f in "$google_secret_file" "$HERMES_HOME/.hermes/google_token.json"; do
+  if [ -f "$f" ]; then
+    chmod 600 "$f"
+    chown "$HERMES_USER:$HERMES_USER" "$f"
+  fi
+done
 
 # --- 4. config ---------------------------------------------------------------
 # model.default: the shipped default is anthropic/claude-opus-4.6, which has no key.

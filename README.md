@@ -62,9 +62,11 @@ To rotate later, same thing with `put-secret-value --secret-id hermes`.
   "OBSIDIAN_PASSWORD": "",
   "OBSIDIAN_VAULT": "",
   "OBSIDIAN_VAULT_PASSWORD": "",
+  "OBSIDIAN_VAULT_PATH": "",
   "HERMES_DASHBOARD_BASIC_AUTH_USERNAME": "",
   "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD": "",
-  "HERMES_DASHBOARD_BASIC_AUTH_SECRET": ""
+  "HERMES_DASHBOARD_BASIC_AUTH_SECRET": "",
+  "GOOGLE_CLIENT_SECRET_JSON": ""
 }
 ```
 
@@ -229,9 +231,14 @@ What it does, and why each piece is the way it is:
 
    Two things it does beyond dumping the JSON:
 
-   - **Drops `TAILSCALE_AUTH_KEY`.** Only user-data reads it, at boot. `.env` is read by
-     the agent process, and the agent has shell access — no reason to hand it a tailnet
-     auth key.
+   - **Drops four keys by name:** `TAILSCALE_AUTH_KEY`, `OBSIDIAN_EMAIL`,
+     `OBSIDIAN_PASSWORD`, `OBSIDIAN_VAULT_PASSWORD`. `.env` is owned by `hermes` and the
+     agent's shell runs as that user, so anything rendered here is agent-readable. The
+     auth key is boot-only (user-data reads it) and joins the tailnet; the three Obsidian
+     keys are the *account* rather than the notes — see the Obsidian section. By name and
+     not by `OBSIDIAN_*` prefix, because `OBSIDIAN_VAULT` and `OBSIDIAN_VAULT_PATH` are a
+     name and a path the agent has use for. The trade: a future `OBSIDIAN_*` credential
+     is not caught for free, so add it to that list.
    - **Renames `MOONSHOT_API_KEY` to `KIMI_API_KEY`.** Hermes has a *native*
      Kimi/Moonshot provider (`kimi-coding`) whose default base URL is already
      `https://api.moonshot.ai/v1`, which is right for a legacy `sk-…` platform key — so
@@ -565,6 +572,73 @@ mount passed and left notes the agent could not see:
 | `free -m` during, and 3 minutes after | Chromium reaped by the 120s inactivity timeout |
 | `systemctl status hermes-gateway`, `journalctl -k` | still running, no OOM kill |
 
+## Google Workspace (calendar, Gmail, Drive)
+
+Hermes has no native Google integration — this is the bundled `google-workspace` skill
+under `~/.hermes/skills/productivity/`, and it reads **files**, not environment variables:
+
+| File | What it is |
+|---|---|
+| `~/.hermes/google_client_secret.json` | the OAuth client. Static — so it lives in the secret |
+| `~/.hermes/google_token.json` | the authorized user token. Rewritten on every refresh |
+
+`GAPI` in that skill's own docs is a **shell alias for its script path**
+(`SKILL.md:170`), not a credential name. Nothing reads a `GAPI` environment variable, so
+putting a key by that name in `.env` does nothing at all.
+
+Section 4b of `install_hermes.sh` writes the client from `GOOGLE_CLIENT_SECRET_JSON` in
+the secret, validating it the way the skill does (JSON with an `installed` or `web`
+object) so a malformed value fails the deploy rather than an OAuth call weeks later. Both
+files are forced to `600` — the skill writes them `644`, and the token is account access.
+A no-op when the key is absent, like the gateway and dashboard sections.
+
+The **token is deliberately not in the secret**: `scripts/google_api.py` rewrites it on
+every refresh, so a stored copy goes stale and a render would clobber a fresher one with
+an older refresh token. Authorizing is a one-time interactive step after a rebuild, the
+same shape as `ob login`:
+
+```sh
+gws=~/.hermes/skills/productivity/google-workspace/scripts/setup.py
+ssh root@hermes "sudo -u hermes -H python3 $gws --auth-url"       # visit it, authorize
+ssh root@hermes "sudo -u hermes -H python3 $gws --auth-code CODE"
+ssh root@hermes "sudo -u hermes -H python3 $gws --check"          # exit 0 = authorized
+```
+
+`GOOGLE_CLIENT_SECRET_JSON` holds the client secret file's own JSON, nested as an object:
+
+```json
+"GOOGLE_CLIENT_SECRET_JSON": {
+  "installed": {
+    "client_id": "….apps.googleusercontent.com",
+    "project_id": "…",
+    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+    "token_uri": "https://oauth2.googleapis.com/token",
+    "auth_provider_x509_cert_url": "https://www.googleapis.com/oauth2/v1/certs",
+    "client_secret": "GOCSPX-…",
+    "redirect_uris": ["http://localhost"]
+  }
+}
+```
+
+This is the only key in the secret that is not a flat string, and that is fine: `jq -r`
+on a non-string prints it back as JSON, so section 4b writes the file unchanged. A
+string-encoded copy of the same JSON (`tojson`) parses identically — the object form is
+just readable in the console. Keep the `client_id` matching whatever issued the existing
+`google_token.json`; a token is tied to its client, so swapping the client invalidates it
+and needs a re-auth.
+
+To write it from a file downloaded out of the Google console, read-modify-write as
+elsewhere:
+
+```sh
+aws secretsmanager get-secret-value --region ca-west-1 --secret-id hermes \
+  --query SecretString --output text \
+  | jq --slurpfile c client_secret.json '.GOOGLE_CLIENT_SECRET_JSON=$c[0]' > hermes.json
+aws secretsmanager put-secret-value --region ca-west-1 --secret-id hermes \
+  --secret-string file://hermes.json
+rm hermes.json client_secret.json
+```
+
 ## Dashboard
 
 Hermes' web UI — config, keys, sessions, chat — on the tailnet and nowhere else. Section
@@ -728,18 +802,19 @@ keys are absent from the secret, exactly like the Phase 4 gateway. On its own:
 ssh root@hermes /usr/local/sbin/hermes-obsidian-install   # or re-run it in place
 ```
 
-Knobs, all optional: `SYNC_MODE=` (below), `VAULT_DIR=` (default `/srv/obsidian`),
+Knobs, all optional: `SYNC_MODE=` (below), `VAULT_DIR=` (overrides
+`OBSIDIAN_VAULT_PATH` in the secret for one run; `/srv/obsidian` if neither is set),
 `OB_VERSION=` and `NODE_MAJOR=`, `FORCE=1` to reinstall the client over the top.
 
 ### Setting it up
 
-Four values in the secret, read-modify-write as in Phase 4:
+Five values in the secret, read-modify-write as in Phase 4:
 
 ```sh
 aws secretsmanager get-secret-value --region ca-west-1 --secret-id hermes \
   --query SecretString --output text \
   | jq '.OBSIDIAN_EMAIL="…" | .OBSIDIAN_PASSWORD="…" | .OBSIDIAN_VAULT="My Vault"
-        | .OBSIDIAN_VAULT_PASSWORD="…"' \
+        | .OBSIDIAN_VAULT_PASSWORD="…" | .OBSIDIAN_VAULT_PATH="/srv/obsidian"' \
   > hermes.json
 aws secretsmanager put-secret-value --region ca-west-1 --secret-id hermes \
   --secret-string file://hermes.json
@@ -749,6 +824,13 @@ rm hermes.json
 `OBSIDIAN_VAULT` is the remote vault's name or ID as `ob sync-list-remote` reports it.
 `OBSIDIAN_VAULT_PASSWORD` is the end-to-end encryption password and is only needed for an
 E2EE vault — leave it empty otherwise. An active Sync subscription is required.
+
+`OBSIDIAN_VAULT_PATH` is where the vault lands, and it is one value read at both ends:
+`install_obsidian.sh` syncs into it and takes ownership of it, and `hermes-render-env`
+puts it in `~/.hermes/.env` so the agent knows where its notes are. The notes land
+*directly* in that directory — there is no per-vault subdirectory under it. It is the one
+`OBSIDIAN_*` key that is not a credential, which is why the denylist names the other
+three instead of matching the prefix.
 
 **2FA needs one interactive login, once.** `ob login` takes `--email`, `--password` and
 `--mfa`, but a code is only valid for about thirty seconds so no unattended run can
@@ -772,9 +854,14 @@ Obsidian account credential sitting in the agent's own home directory —
 `install_obsidian.sh` warns if it finds one. Clear it with
 `sudo -u hermes -H ob logout`.
 
-**The `OBSIDIAN_*` keys never reach `~/.hermes/.env`** — `hermes-render-env`'s denylist
-drops them alongside `TAILSCALE_AUTH_KEY`, and `install_obsidian.sh` reads them from
-Secrets Manager directly instead. The reasoning is in the comment on that filter.
+**The Obsidian *credentials* never reach `~/.hermes/.env`** — `hermes-render-env` drops
+`OBSIDIAN_EMAIL`, `OBSIDIAN_PASSWORD` and `OBSIDIAN_VAULT_PASSWORD` by name, alongside
+`TAILSCALE_AUTH_KEY`, and `install_obsidian.sh` reads them from Secrets Manager directly
+instead. That email and password are every vault on the account plus the ability to change
+the password; the vault password is the encryption key. `OBSIDIAN_VAULT` and
+`OBSIDIAN_VAULT_PATH` are *not* dropped — a vault name and a path are things the agent has
+a use for, and the split this section describes is about the account, not the notes. The
+reasoning is in the comment on that filter.
 
 **The sync daemon runs as root, and so does the login.** Deliberate, and the one place
 this repo departs from "services run as `hermes`". The stored Obsidian session lands in
@@ -878,6 +965,13 @@ ssh root@hermes 'ob sync-status --path /srv/obsidian'
 - Egress includes TCP 80 and UDP 53 beyond the plan's 443/41641: Ubuntu's arm64 apt
   mirrors are plain HTTP and DNS must reach the VPC resolver. Drop them and the box
   cannot patch itself or resolve anything.
+- **A hand-added `GAPI` key was on the live box's `.env`, and nothing ever read it.** It
+  was not in the secret and no script here writes it; `hermes-render-env` rewrites that
+  file from the secret on every run *and* from both units' `ExecStartPre`, so it is gone
+  now. It was not doing anything even while it was there — `GAPI` is a shell alias in the
+  google-workspace skill's docs, not a variable that skill reads. See **Google Workspace**
+  for where those credentials actually belong. (`OBSIDIAN_VAULT_PATH` was hand-added the
+  same way and is now a real secret key — see the Obsidian section.)
 - The AMI comes from Canonical's SSM public parameter, but the instance ignores AMI
   changes so a new Canonical image never silently replaces the running agent. To move
   to a newer image: `terraform taint aws_instance.hermes` then apply, on purpose.

@@ -21,7 +21,9 @@ set -euo pipefail
 
 OB_VERSION="${OB_VERSION:-0.0.14}"    # open beta; pin it. Unpin at your own risk.
 NODE_MAJOR="${NODE_MAJOR:-22}"        # obsidian-headless engines: node >=22
-VAULT_DIR="${VAULT_DIR:-/srv/obsidian}"
+# Resolved after the secret is read (section 1): OBSIDIAN_VAULT_PATH is the source of
+# truth, and an explicit VAULT_DIR= still wins for a one-off.
+VAULT_DIR="${VAULT_DIR:-}"
 SYNC_MODE="${SYNC_MODE:-bidirectional}"   # or pull-only / mirror-remote (read-only)
 # Attachment types to sync: image, audio, video, pdf, unsupported. Empty string clears.
 OB_FILE_TYPES="${OB_FILE_TYPES:-image,audio,video,pdf,unsupported}"
@@ -48,12 +50,16 @@ esac
 
 as_hermes() { cd "$HERMES_HOME" && sudo -u "$HERMES_USER" -H "$@"; }
 
-# --- 1. credentials ----------------------------------------------------------
-# Read straight from Secrets Manager, never from ~/.hermes/.env. The account
-# password is access to *every* vault on the account, and .env is read by an agent
-# that has a shell — so hermes-render-env deletes the OBSIDIAN_* keys on the way
-# through (same reason it deletes TAILSCALE_AUTH_KEY). This script has the instance
-# role, so it does not need them there.
+# --- 1. credentials and the vault path ---------------------------------------
+# Read straight from Secrets Manager, never from ~/.hermes/.env. The account password is
+# access to *every* vault on the account, and .env is read by an agent that has a shell —
+# so hermes-render-env drops OBSIDIAN_EMAIL, OBSIDIAN_PASSWORD and
+# OBSIDIAN_VAULT_PASSWORD by name (same reason it drops TAILSCALE_AUTH_KEY). This script
+# has the instance role, so it does not need them there.
+#
+# OBSIDIAN_VAULT_PATH is the exception it does render: the agent needs to know where its
+# notes are, and it is a path rather than a credential. Reading it here as well is what
+# keeps the two ends agreeing — this script syncs to it, the agent's .env names it.
 secret=$("$AWS" secretsmanager get-secret-value \
   --secret-id "$SECRET_ID" --region "$REGION" \
   --query SecretString --output text)
@@ -63,7 +69,19 @@ OBSIDIAN_EMAIL=$(get OBSIDIAN_EMAIL)
 OBSIDIAN_PASSWORD=$(get OBSIDIAN_PASSWORD)
 OBSIDIAN_VAULT=$(get OBSIDIAN_VAULT)
 OBSIDIAN_VAULT_PASSWORD=$(get OBSIDIAN_VAULT_PASSWORD)
+OBSIDIAN_VAULT_PATH=$(get OBSIDIAN_VAULT_PATH)
 unset secret
+
+# The vault syncs *into* this directory — the notes land directly in it, no
+# per-vault subdirectory — so it is also the path the chown/chmod pass in section 4
+# walks recursively. Hence the guard: an absolute path that is not `/`. A relative or
+# empty value would make `chown -R` and `find` in section 4 run somewhere unintended.
+VAULT_DIR="${VAULT_DIR:-${OBSIDIAN_VAULT_PATH:-/srv/obsidian}}"
+case "$VAULT_DIR" in
+  /) echo "VAULT_DIR is / — refusing to take ownership of the whole filesystem" >&2; exit 1 ;;
+  /*) ;;
+  *) echo "VAULT_DIR must be an absolute path, got '$VAULT_DIR'" >&2; exit 1 ;;
+esac
 
 if [ -z "$OBSIDIAN_EMAIL" ] || [ -z "$OBSIDIAN_PASSWORD" ] || [ -z "$OBSIDIAN_VAULT" ]; then
   echo "==> no OBSIDIAN_EMAIL/OBSIDIAN_PASSWORD/OBSIDIAN_VAULT in the secret — skipping Obsidian"
