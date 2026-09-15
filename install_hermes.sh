@@ -15,7 +15,7 @@ set -euo pipefail
 
 HERMES_USER="${HERMES_USER:-hermes}"
 HERMES_HOME="/home/$HERMES_USER"
-MODEL_DEFAULT="${MODEL_DEFAULT:-kimi/kimi-k3}"
+MODEL_DEFAULT="${MODEL_DEFAULT:-kimi/kimi-k2.6}"
 FORCE="${FORCE:-0}"
 # The literals are the normal case now that nothing templates this script; deploy.sh
 # forwards SECRET_ID/REGION only when they are set in its own environment.

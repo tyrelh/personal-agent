@@ -249,7 +249,9 @@ What it does, and why each piece is the way it is:
      `api.kimi.com/coding` instead.)
 4. **`model.default`.** The shipped default is `anthropic/claude-opus-4.6`, which has no
    key. The Moonshot key serves `kimi-k2.6`, `kimi-k2.7-code`, `kimi-k2.7-code-highspeed`
-   and `kimi-k3`. Adding `ANTHROPIC_API_KEY` to the secret later needs no script change —
+   and `kimi-k3`. `kimi-k2.6` is the default because it is the cheap one and most of what
+   this box does is routine; `kimi-k3` is a deliberate per-task or per-cron swap, not the
+   floor. Adding `ANTHROPIC_API_KEY` to the secret later needs no script change —
    it renders on the next run, and `model.provider` is `auto`.
 
 To check `hermes-render-env` itself — it must be re-runnable, and a failed fetch must
@@ -281,7 +283,7 @@ Six settings, and the first one is the whole phase:
 | `approvals.cron_mode` | `approve` | A cron job has no approval channel, so `deny` does not mean "ask someone" — it means "block the command". |
 | `approvals.single_query_mode` | `approve` | Same for a `hermes -q`/`-z` session. |
 | `approvals.unattended_mode` | `approve` | Same for unattended platforms; the Slack gateway is one. |
-| `model.default` | `kimi/kimi-k3` | Phase 2. |
+| `model.default` | `kimi/kimi-k2.6` | Phase 2. |
 
 The four `approvals` keys were decoration under the old container backend — Hermes skips
 the dangerous-command approval stack entirely when the shell is in a container, because
