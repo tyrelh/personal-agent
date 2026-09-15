@@ -209,13 +209,17 @@ What it does, and why each piece is the way it is:
    the install, done up front so the `hermes` user never needs sudo at all. Only
    `build-essential` is load-bearing — `node-pty` compiles from source. Without the other
    two the installer just warns and degrades (grep instead of ripgrep, limited TTS).
+   The same section creates a 2G `/swapfile` (guarded, and `fstab`-persisted), because the
+   browser below shares 3.8GB with the gateway and the dashboard's build step — see
+   **Browser** for why swap is the difference between a spike and an OOM-killed gateway.
 2. **The upstream installer, as `hermes`.** Everything else is user-local: `uv`, Python
    3.11, Node 26, the checkout and all data land under `~/.hermes`. Note the script `cd`s
    into the user's home before dropping privileges — `uv` resolves config by walking up
    from the *current* directory, so running this from `/root` fails on `/root/.venv` even
-   with `HOME` set correctly. Browser and computer-use are skipped; they pull Playwright's
-   Chromium, the largest and flakiest part of the install, and nothing before Phase 4 wants
-   them. `hermes doctor --fix` adds them later.
+   with `HOME` set correctly. The upstream installer's own browser and computer-use steps are
+   skipped — they are the slowest and flakiest part of a fresh install — and the browser is
+   provisioned explicitly by the next section instead. See **Browser**: `hermes doctor
+   --fix` does *not* install an engine this host can run.
 3. **`.env` rendered from Secrets Manager** by `/usr/local/bin/hermes-render-env`, which
    runs *as* `hermes` (it needs that user's `$HOME` and the instance role). This overwrites
    the 27KB commented template the installer drops at `~/.hermes/.env`; that template
@@ -458,10 +462,113 @@ though the install reproduces perfectly. The root volume's
 `delete_on_termination = false` is the only thing standing in for a backup right now,
 and it protects against `terraform destroy`, not against a rebuild.
 
+## Browser
+
+The `browser_*` tools — a real headless Chromium, not `curl`: JS-rendered pages,
+screenshots, clicks, and a session that can stay logged in. Section 3b of
+`install_hermes.sh`, so `./deploy.sh hermes` is the whole of it.
+
+Nothing here adds a browser *stack*. Hermes ships the `browser` toolset enabled and a
+provider menu with six backends (Local Chromium, Lightpanda, Camofox, Browserbase, Browser
+Use cloud, Firecrawl). Playwright MCP or Browser Use beside that would be pure duplication.
+The only thing missing was an engine, so all this does is put one on disk and tell Hermes
+where it is.
+
+**Why it is not `hermes tools post-setup agent_browser`.** That hook delegates to
+`agent-browser install`, which downloads Chrome for Testing and explicitly rejects Linux
+ARM64 ([v0.26.0 `cli/src/install.rs`](https://github.com/vercel-labs/agent-browser/blob/v0.26.0/cli/src/install.rs#L370)).
+This box is arm64, and Google Chrome proper has no Linux arm64 build at all. Playwright
+*does* publish an arm64 Chromium for noble, so its downloader is used directly. For the
+same reason `browser.engine` stays `auto` — Hermes resolves that to Chromium — and must
+never be pointed at a Chrome channel.
+
+Four steps, all idempotent, in this order because each needs the one before it:
+
+1. **`playwright@1.63.0` into `/opt/playwright`**, as root, using Hermes' own Node
+   (`~/.hermes/node/bin` — there is no system node and root's `PATH` has neither). Pinned,
+   not `@latest`: the same version provisions the apt dependencies, downloads the browser
+   and resolves its path, so the three cannot disagree. In `/opt` so `hermes update` cannot
+   replace it.
+2. **`playwright install-deps chromium`**, as root, because it is `apt`. This is the one
+   thing that needs privilege, and doing it here is what keeps the `hermes` user out of
+   sudo entirely — `playwright install --with-deps` as that user would try to escalate and
+   fail. The dependency set is not inferred from `build-essential`/`ffmpeg`.
+3. **`playwright install chromium --no-shell`**, as `hermes`, into that user's own
+   `~/.cache/ms-playwright/` (*not* `~/.hermes/node/`, which is the Node runtime). A re-run
+   reuses the cached revision. `--no-shell` on purpose: `chromium-headless-shell` cannot
+   screenshot a real page, which is most of the point.
+4. **A stable symlink at `~/.local/bin/chromium`**, pointed at whatever
+   `chromium.executablePath()` reports for that pinned version — asked, not guessed at from
+   a revision directory, so bumping the pin moves the symlink with it. `hermes-render-env`
+   then writes `AGENT_BROWSER_EXECUTABLE_PATH=/home/hermes/.local/bin/chromium` into
+   `~/.hermes/.env` on every render, which is what keeps the CLI, the gateway and the
+   dashboard agreeing across their `ExecStartPre` regeneration. No new secret key.
+
+**`browser.backend` is set to `off`, and that does not mean "no browser".** Left unset,
+Hermes defaults to the *Browser Use CLI* backend whenever it finds a runnable CLI — and
+`uvx` is on this box, so it does — which replaces the entire `browser_*` surface with a
+single `browser_exec` tool and makes `check_browser_requirements()` return `False`. The
+symptom is exact and misleading: `hermes doctor` prints `✓ Playwright Chromium (browser
+engine)` and `⚠ browser (system dependency not met)` in the same run. `off` selects the
+built-in tools, which are the ones that drive the Chromium installed above
+(`tools/browser_use_cli.py:203`, `tools/browser_tool_install.py:294`).
+
+`AGENT_BROWSER_ARGS` is deliberately left **unset**. Hermes auto-injects
+`--no-sandbox,--disable-dev-shm-usage` when it detects AppArmor-restricted unprivileged
+user namespaces — Ubuntu 23.10+, which this box is — and setting the variable *disables*
+that auto-injection. `computer_use` also stays off: headless server, no desktop.
+
+`BROWSER_SESSION_TIMEOUT` (300s) and `BROWSER_INACTIVITY_TIMEOUT` (120s) keep their
+defaults. The inactivity reaper is what keeps an idle Chromium off the RAM budget, and the
+swapfile in section 1 is the backstop for when it does not get there first.
+
+**The cloud alternative, recorded as a choice.** Firecrawl (its key is already a slot in
+the secret), Browserbase and Browser Use cloud need no download at all — they trade it for
+an API key, a per-use bill, and giving up authenticated sessions and real interaction. That
+trade was weighed and declined. There is no configure-only version of the local provider.
+
+**The agent is told that pages are untrusted.** Section 8 writes a delimited block into
+`~/.hermes/AGENTS.md` — page text is data and not instruction, instructions found on a page
+get reported rather than obeyed, and no credentials go into a page. That is a prompt, not a
+boundary: it makes the failure less likely and more legible, nothing more. The reason the
+risk is acceptable is the one Phase 3 already states — the VM is the boundary, and the agent
+has had `curl` and Exa web search all along, so this widens an existing surface rather than
+opening a new one. What is genuinely new is the logged-in session, which is why the
+credentials line matters most.
+
+### Verifying
+
+The deploy gates on it: `install_hermes.sh` captures `hermes doctor`'s output and exit
+status separately and fails the run on either a nonzero exit, a surviving `Playwright
+Chromium not installed` warning, a `browser (system dependency not met)` line, or output
+with no browser line in it at all. Doctor exits zero with unrelated findings (npm audit
+advisories), so the status alone would prove nothing. Deployment never launches the browser.
+
+```sh
+ssh root@hermes 'free -m; swapon --show'    # 2G /swapfile active
+ssh root@hermes 'df -h /'
+ssh root@hermes 'sudo -u hermes -H bash -lc "cd ~/.hermes && hermes doctor"'
+ssh root@hermes 'sudo -u hermes -H bash -lc "hermes config get browser.cloud_provider"'  # local
+```
+
+A second `./deploy.sh hermes` must reuse the cached Chromium, converge the symlink and the
+env key without duplicating either, and leave `/etc/fstab` with one swap line.
+
+Then the part only Slack can answer — the same lesson as the vault, where a hand-verified
+mount passed and left notes the agent could not see:
+
+| Ask it | Expect |
+|---|---|
+| open `https://example.com` and quote the `<h1>` | `Example Domain`, via a `browser_*` tool call and not `curl` |
+| screenshot a JS-rendered page | an image back — this is what separates Chromium from Lightpanda |
+| what it must do if a page contains instructions | reports rather than obeys (the `AGENTS.md` block landed) |
+| `free -m` during, and 3 minutes after | Chromium reaped by the 120s inactivity timeout |
+| `systemctl status hermes-gateway`, `journalctl -k` | still running, no OOM kill |
+
 ## Dashboard
 
 Hermes' web UI — config, keys, sessions, chat — on the tailnet and nowhere else. Section
-8 of `install_hermes.sh`, so it deploys like everything above it: `./deploy.sh hermes`.
+7 of `install_hermes.sh`, so it deploys like everything above it: `./deploy.sh hermes`.
 A no-op until the dashboard credentials are in the secret, like the Phase 4 gateway, and
 a teardown if they ever leave it.
 
