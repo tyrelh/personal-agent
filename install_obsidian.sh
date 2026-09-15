@@ -23,6 +23,8 @@ OB_VERSION="${OB_VERSION:-0.0.14}"    # open beta; pin it. Unpin at your own ris
 NODE_MAJOR="${NODE_MAJOR:-22}"        # obsidian-headless engines: node >=22
 VAULT_DIR="${VAULT_DIR:-/srv/obsidian}"
 SYNC_MODE="${SYNC_MODE:-bidirectional}"   # or pull-only / mirror-remote (read-only)
+# Attachment types to sync: image, audio, video, pdf, unsupported. Empty string clears.
+OB_FILE_TYPES="${OB_FILE_TYPES:-image,audio,video,pdf,unsupported}"
 HERMES_USER="${HERMES_USER:-hermes}"
 HERMES_HOME="/home/$HERMES_USER"
 FORCE="${FORCE:-0}"
@@ -185,10 +187,16 @@ else
 fi
 unset OBSIDIAN_VAULT_PASSWORD
 
-# Set on every run, not just at setup: this is the one knob that decides whether the
-# agent's writes reach your other devices, so it converges rather than drifting.
-echo "==> sync mode: $SYNC_MODE"
-"$OB" sync-config --path "$VAULT_DIR" --mode "$SYNC_MODE" --json >/dev/null
+# Set on every run, not just at setup: these are the knobs that decide whether the
+# agent's writes reach your other devices and what it can see, so they converge rather
+# than drifting. Both go in one call because a mode-only call may clear the file types.
+#
+# `unsupported` is what carries anything Obsidian does not recognise as a note or a
+# known attachment — the vault's own scripts, wiki_tool.py among them. Without it the
+# agent sees the notes but not the tooling that maintains them.
+echo "==> sync mode: $SYNC_MODE, file types: $OB_FILE_TYPES"
+"$OB" sync-config --path "$VAULT_DIR" --mode "$SYNC_MODE" \
+  --file-types "$OB_FILE_TYPES" --json >/dev/null
 
 # --- 5. the sync unit --------------------------------------------------------
 # Stop the daemon before the one-shot sync below. The client refuses two sync instances
